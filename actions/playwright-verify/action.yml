@@ -14,9 +14,9 @@ inputs:
     required: false
     default: '30'
   repository:
-    description: 'Repository name'
+    description: 'Repository name (use ${{ github.repository }})'
     required: false
-    default: ${{ github.repository }}
+    default: ''
   issue-ids:
     description: 'Comma-separated GitHub issue IDs'
     required: false

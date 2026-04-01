@@ -10,12 +10,11 @@ inputs:
     required: true
   repository:
     description: 'Repository name (use ${{ github.repository }})'
-    required: false
-    default: ${{ github.repository }}
+    required: true
   run-url:
     description: 'URL to the workflow run'
     required: false
-    default: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+    default: ''
   issue-ids:
     description: 'Comma-separated GitHub issue IDs'
     required: false
@@ -36,11 +35,16 @@ runs:
         REPO_SHORT="${REPO##*/}"
         STAGE="${{ inputs.stage }}"
         STATUS="${{ inputs.job-status }}"
+        RUN_URL="${{ inputs.run-url }}"
 
         if [ "$STATUS" = "success" ]; then
           TEXT="CI pro ${REPO_SHORT}: ${STAGE} uspesne dokoncen."
         elif [ "$STATUS" = "failure" ]; then
-          TEXT="CI pro ${REPO_SHORT}: ${STAGE} selhal. Viz ${{ inputs.run-url }}"
+          if [ -n "$RUN_URL" ]; then
+            TEXT="CI pro ${REPO_SHORT}: ${STAGE} selhal. Viz ${RUN_URL}"
+          else
+            TEXT="CI pro ${REPO_SHORT}: ${STAGE} selhal."
+          fi
         elif [ "$STATUS" = "cancelled" ]; then
           TEXT="CI pro ${REPO_SHORT}: ${STAGE} byl zrusen."
         else

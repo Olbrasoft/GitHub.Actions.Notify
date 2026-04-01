@@ -7,16 +7,15 @@ inputs:
     required: true
   repository:
     description: 'Repository name (use ${{ github.repository }})'
+    required: true
+  run-url:
+    description: 'URL to the workflow run'
     required: false
-    default: ${{ github.repository }}
+    default: ''
   environment:
     description: 'Deployment environment name'
     required: false
     default: 'production'
-  run-url:
-    description: 'URL to the workflow run'
-    required: false
-    default: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
   issue-ids:
     description: 'Comma-separated GitHub issue IDs'
     required: false
@@ -37,11 +36,16 @@ runs:
         REPO_SHORT="${REPO##*/}"
         ENV="${{ inputs.environment }}"
         STATUS="${{ inputs.job-status }}"
+        RUN_URL="${{ inputs.run-url }}"
 
         if [ "$STATUS" = "success" ]; then
           TEXT="Deploy ${REPO_SHORT} na ${ENV} uspesne dokoncen."
         elif [ "$STATUS" = "failure" ]; then
-          TEXT="Deploy ${REPO_SHORT} na ${ENV} selhal. Viz ${{ inputs.run-url }}"
+          if [ -n "$RUN_URL" ]; then
+            TEXT="Deploy ${REPO_SHORT} na ${ENV} selhal. Viz ${RUN_URL}"
+          else
+            TEXT="Deploy ${REPO_SHORT} na ${ENV} selhal."
+          fi
         else
           TEXT="Deploy ${REPO_SHORT} na ${ENV} skoncil se stavem ${STATUS}."
         fi
