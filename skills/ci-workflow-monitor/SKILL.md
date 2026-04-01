@@ -119,26 +119,29 @@ Act fully autonomously. NEVER ask the user. Only notify on STATE CHANGES.
 3. Check review:
    gh pr view {PR_NUMBER} --repo {OWNER}/{REPO} --json reviewDecision,reviews
 
-   Branch protection requires CI checks to pass (Check & Clippy, Format, Test).
-   Copilot code review is optional — if active, wait for it; if not, proceed.
+   Branch protection requires CI checks (Check & Clippy, Format, Test).
+   Copilot code review runs as "Agent" check-run — MUST wait for it before merging.
 
-   Strategy: attempt merge. If blocked by CI, wait. If CI passed, check for Copilot review.
+   **NEVER attempt merge before both CI and Copilot review are done.**
 
-   a) Attempt merge:
-      gh pr merge {PR_NUMBER} --repo {OWNER}/{REPO} --merge 2>&1
-      - If merge SUCCEEDS → Notify: "PR #{PR_NUMBER} mergnut (issue #{ISSUE_NUM}). Sleduji deploy." → Phase 2
-      - If merge FAILS with "required status checks" → CI still running → STOP, wait for next tick
+   a) Check Copilot review status (deterministicky přes API):
+      HEAD=$(gh pr view {PR_NUMBER} --repo {OWNER}/{REPO} --json headRefOid --jq '.headRefOid')
+      AGENT_STATUS=$(gh api "repos/{OWNER}/{REPO}/commits/${HEAD}/check-runs" --jq '.check_runs[] | select(.name == "Agent") | .status' 2>/dev/null)
 
-   b) If merge is blocked, check for Copilot review comments while waiting:
+      - AGENT_STATUS is empty → Copilot not active/subscribed → skip review, go to step (c)
+      - AGENT_STATUS is "in_progress" or "queued" → say "Waiting for Copilot review" → STOP
+      - AGENT_STATUS is "completed" → go to step (b)
+
+   b) Read and fix Copilot review comments:
       gh api repos/{OWNER}/{REPO}/pulls/{PR_NUMBER}/comments --jq '.[].body'
-      - Has actionable review comments → fix all, commit, push. Notify: "Review komentáře opraveny."
-      - No comments → just wait
+      - Has actionable comments → fix ALL, commit, push. Notify: "Review komentáře opraveny."
+        After push, new CI + review cycle starts → STOP, wait for next tick
+      - No actionable comments → go to step (c)
 
-   c) If CI passed but Copilot review is still running (merge would succeed but review not done):
-      Check: gh run list --repo {OWNER}/{REPO} --workflow "Copilot code review" --branch {BRANCH} --limit 1 --json status --jq '.[0].status'
-      - "in_progress" or "queued" → say "CI passed, waiting for Copilot review" → STOP, wait for next tick
-      - "completed" → check for comments, fix if needed, then merge
-      - No Copilot workflow found (not subscribed) → merge immediately
+   c) Merge:
+      gh pr merge {PR_NUMBER} --repo {OWNER}/{REPO} --merge 2>&1
+      - SUCCEEDS → Notify: "PR #{PR_NUMBER} mergnut (issue #{ISSUE_NUM}). Sleduji deploy."
+      - FAILS → report error, STOP
 
 ## Phase 2: Deploy + Verify
 
