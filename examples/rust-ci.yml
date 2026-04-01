@@ -116,7 +116,7 @@ jobs:
 
       - name: Notify deploy result
         if: always()
-        uses: Olbrasoft/GitHub.Actions.Notify/actions/deploy-status@main
+        uses: Olbrasoft/GitHub.Actions.Notify/actions/deploy-status@v1
         with:
           job-status: ${{ job.status }}
           repository: ${{ github.repository }}
@@ -131,7 +131,8 @@ jobs:
         run: sleep 10
 
       - name: Verify production
-        uses: Olbrasoft/GitHub.Actions.Notify/actions/playwright-verify@main
+        uses: Olbrasoft/GitHub.Actions.Notify/actions/playwright-verify@v1
         with:
           url: https://ceskarepublika.wiki
           checks: health,homepage
+          repository: ${{ github.repository }}

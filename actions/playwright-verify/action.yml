@@ -106,7 +106,7 @@ runs:
         echo "text=${TEXT}" >> "$GITHUB_OUTPUT"
 
     - name: Send notification
-      uses: Olbrasoft/GitHub.Actions.Notify/actions/notify@main
+      uses: Olbrasoft/GitHub.Actions.Notify/actions/notify@v1
       with:
         text: ${{ steps.build-text.outputs.text }}
         source: ci-pipeline

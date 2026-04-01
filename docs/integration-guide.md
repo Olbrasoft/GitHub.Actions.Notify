@@ -1,14 +1,22 @@
 # Integration Guide
 
-Step-by-step guide to integrate GitHub.Actions.Notify into any Olbrasoft project.
+Step-by-step guide to integrate GitHub.Actions.Notify into any project.
 
 ## Prerequisites
 
-- VirtualAssistant running on `localhost:5055` with `ci-pipeline` agent type (AgentType ID 30)
-- `gh` CLI authenticated
-- sudo access for systemd service installation
+- [VirtualAssistant](https://github.com/Olbrasoft/VirtualAssistant) running on `localhost:5055` with `ci-pipeline` agent type (AgentType ID 30)
+- `gh` CLI authenticated (`gh auth status`)
+- `sudo` access for systemd service installation
+- `jq` and `curl` installed
 
-## Step 1: Register Self-Hosted Runner
+## Step 1: Clone This Repository
+
+```bash
+cd ~/GitHub/Olbrasoft  # or wherever you keep repos
+git clone https://github.com/Olbrasoft/GitHub.Actions.Notify.git
+```
+
+## Step 2: Register Self-Hosted Runner
 
 Run the setup script (one-time per repository):
 
@@ -18,124 +26,197 @@ cd ~/GitHub/Olbrasoft/GitHub.Actions.Notify
 ```
 
 This will:
-1. Download the latest GitHub Actions runner
-2. Register it with your repository
-3. Install it as a systemd service
+1. Download the latest GitHub Actions runner to `~/actions-runner-<repo>/`
+2. Register it with your repository using a token from GitHub API
+3. Install it as a systemd service (auto-start on boot)
 
-Verify the runner is running:
+Verify the runner is online:
 
 ```bash
-sudo systemctl status actions.runner.Olbrasoft-<your-repo>.$(hostname)-<your-repo>.service
+# Check systemd service
+sudo systemctl status actions.runner.Olbrasoft-<repo>.$(hostname)-<repo>.service
+
+# Check on GitHub
+gh api repos/Olbrasoft/<your-repo>/actions/runners --jq '.runners[] | "\(.name): \(.status)"'
 ```
 
-Also check: `https://github.com/Olbrasoft/<your-repo>/settings/actions/runners`
+## Step 3: Add Notification Steps to CI Workflow
 
-## Step 2: Add Notification Steps to CI Workflow
+Edit your `.github/workflows/ci.yml` (or equivalent). The key change: **deploy and verify jobs must run on `self-hosted`** to access VirtualAssistant on localhost.
 
 ### Minimal — Deploy notification only
 
-Add to the end of your deploy job (must run on `self-hosted`):
+Add a notification step at the end of your deploy job:
 
 ```yaml
   deploy:
-    runs-on: self-hosted
+    runs-on: self-hosted  # Required for localhost access
+    needs: [test]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     steps:
       # ... your existing deploy steps ...
 
       - name: Notify deploy result
         if: always()
-        uses: Olbrasoft/GitHub.Actions.Notify/actions/deploy-status@main
+        uses: Olbrasoft/GitHub.Actions.Notify/actions/deploy-status@v1
         with:
           job-status: ${{ job.status }}
+          repository: ${{ github.repository }}
 ```
 
-### Full — Deploy + production verification
+### Recommended — Deploy + production verification
 
 Add a verify job after deploy:
 
 ```yaml
+  deploy:
+    runs-on: self-hosted
+    needs: [test]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      # ... your deploy steps ...
+
+      - name: Notify deploy result
+        if: always()
+        uses: Olbrasoft/GitHub.Actions.Notify/actions/deploy-status@v1
+        with:
+          job-status: ${{ job.status }}
+          repository: ${{ github.repository }}
+
   verify:
     runs-on: self-hosted
     needs: [deploy]
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     steps:
       - name: Wait for deployment propagation
         run: sleep 10
-      - uses: Olbrasoft/GitHub.Actions.Notify/actions/playwright-verify@main
+
+      - name: Verify production
+        uses: Olbrasoft/GitHub.Actions.Notify/actions/playwright-verify@v1
         with:
           url: https://your-production-url.com
           checks: health,homepage
+          repository: ${{ github.repository }}
 ```
 
-### CI stage notifications
+### Per-stage CI notifications
 
-Add to any CI job for per-stage notifications:
+To get TTS notifications for each CI stage (build, test, etc.), add to each job. Note: these jobs must also run on `self-hosted`:
 
 ```yaml
   test:
-    runs-on: self-hosted  # Must be self-hosted for localhost access
+    runs-on: self-hosted
     steps:
       # ... your test steps ...
+
       - name: Notify test result
         if: always()
-        uses: Olbrasoft/GitHub.Actions.Notify/actions/ci-status@main
+        uses: Olbrasoft/GitHub.Actions.Notify/actions/ci-status@v1
         with:
           job-status: ${{ job.status }}
           stage: test
+          repository: ${{ github.repository }}
 ```
 
-## Step 3: Add Claude Code Skill (Optional)
+## Step 4: Hybrid Runner Strategy
+
+For projects with expensive CI (e.g., Rust compilation), use a **hybrid approach** — cloud runners for build/test, self-hosted only for deploy/verify:
+
+| Job | Runner | Why |
+|-----|--------|-----|
+| check, fmt, test | `ubuntu-latest` | Free cloud CI, parallel, no local CPU usage |
+| deploy | `self-hosted` | VPS access + localhost notifications |
+| verify | `self-hosted` | Playwright + localhost notifications |
+
+For lightweight projects (.NET, Node.js), you can run everything on `self-hosted`.
+
+## Step 5: Add Claude Code Skill (Recommended)
 
 Link the CI workflow monitor skill to your project:
 
 ```bash
-cd ~/GitHub/Olbrasoft/<your-repo>
+cd ~/your-project
 mkdir -p .claude/skills
-ln -s ~/GitHub/Olbrasoft/GitHub.Actions.Notify/skills/ci-workflow-monitor .claude/skills/ci-workflow-monitor
+ln -sf ~/GitHub/Olbrasoft/GitHub.Actions.Notify/skills/ci-workflow-monitor .claude/skills/ci-workflow-monitor
 ```
 
-This enables Claude Code to autonomously monitor CI/CD pipeline status after creating PRs.
+This skill contains the CronCreate prompt template that Claude Code uses to autonomously monitor the entire CI/CD pipeline after creating a PR.
 
-## Step 4: Update CLAUDE.md (Optional)
+## Step 6: Update Project CLAUDE.md (Recommended)
 
-Add to your project's CLAUDE.md:
+Add the following to your project's CLAUDE.md in the Development Workflow section:
 
 ```markdown
-## CI/CD Feedback
+### CI/CD Feedback (Autonomous)
 
-After creating a PR, use the `ci-workflow-monitor` skill to set up CronCreate polling.
+After creating a PR, ALWAYS set up CronCreate monitoring — this is mandatory.
+
+Use the template from `ci-workflow-monitor` skill:
+- CronCreate polls every 2 minutes
+- Autonomously: fixes CI failures, addresses review comments, merges PRs
+- After merge: monitors deploy, verifies production
+- Reads issue description and verifies issue-specific changes on production
+- NEVER asks the user — acts fully autonomously
+
 Deploy and verify jobs run on self-hosted runner with TTS notifications via VirtualAssistant.
+Production URL: https://your-production-url.com
 ```
 
-## Hybrid Runner Strategy
+## Step 7: Test the Integration
 
-For projects with expensive CI (like Rust compilation):
-
-| Job | Runner | Why |
-|-----|--------|-----|
-| check, fmt, test | `ubuntu-latest` | Free cloud CI, parallel execution |
-| deploy | `self-hosted` | Access to VPS secrets, localhost notifications |
-| verify | `self-hosted` | Local Playwright, localhost notifications |
-
-For lightweight projects (.NET, Node.js), you can run everything on `self-hosted`.
+1. Create a test branch with a small change
+2. Push and create a PR
+3. Watch GitHub Actions — CI should run on cloud, deploy on self-hosted
+4. After deploy, you should hear the TTS notification
+5. Verify job should check production health and homepage
+6. If using Claude Code: CronCreate should detect the status changes
 
 ## Troubleshooting
 
 ### Notification not arriving
 
-1. Check VirtualAssistant is running: `curl http://localhost:5055/api/notifications -X POST -H "Content-Type: application/json" -d '{"text":"test","source":"ci-pipeline"}'`
-2. Check the `ci-pipeline` agent type exists in VirtualAssistant database
-3. Check runner can reach localhost: run `curl localhost:5055/health` on the runner
+```bash
+# 1. Test VirtualAssistant endpoint directly
+curl -s -X POST "http://localhost:5055/api/notifications" \
+  -H "Content-Type: application/json" \
+  -d '{"text":"Test notification","source":"ci-pipeline"}' | jq .
+
+# 2. Check ci-pipeline agent exists
+# Should return success. If 400 error about invalid agent name,
+# the CiPipeline agent type needs to be added to VirtualAssistant.
+
+# 3. Check runner can reach localhost
+# SSH into runner or run on runner machine:
+curl -s http://localhost:5055/health
+```
 
 ### Runner offline
 
 ```bash
-sudo systemctl restart actions.runner.Olbrasoft-<repo>.<hostname>-<repo>.service
-sudo journalctl -u actions.runner.Olbrasoft-<repo>.<hostname>-<repo>.service -f
+# Check service status
+sudo systemctl status actions.runner.Olbrasoft-<repo>.*
+
+# Restart
+sudo systemctl restart actions.runner.Olbrasoft-<repo>.*
+
+# View logs
+sudo journalctl -u actions.runner.Olbrasoft-<repo>.* -f
 ```
+
+### Action template validation error
+
+If you see `Unrecognized named-value: 'job'` or similar — make sure you're using `@v1` tag (not `@main`). Earlier versions had expression syntax in input descriptions.
 
 ### Playwright not available
 
 ```bash
 npx playwright install chromium
+```
+
+### Deploy works but verify is skipped
+
+Check the `if` condition on the verify job. It should match the deploy job's conditions:
+
+```yaml
+if: github.ref == 'refs/heads/main' && github.event_name == 'push'
 ```

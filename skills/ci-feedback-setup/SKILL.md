@@ -68,7 +68,7 @@ Read the existing `.github/workflows/ci.yml` (or equivalent) and add:
     # ADD at the end:
     - name: Notify deploy result
       if: always()
-      uses: Olbrasoft/GitHub.Actions.Notify/actions/deploy-status@main
+      uses: Olbrasoft/GitHub.Actions.Notify/actions/deploy-status@v1
       with:
         job-status: ${{ job.status }}
         repository: ${{ github.repository }}
@@ -85,7 +85,7 @@ Read the existing `.github/workflows/ci.yml` (or equivalent) and add:
       - name: Wait for deployment propagation
         run: sleep 10
       - name: Verify production
-        uses: Olbrasoft/GitHub.Actions.Notify/actions/playwright-verify@main
+        uses: Olbrasoft/GitHub.Actions.Notify/actions/playwright-verify@v1
         with:
           url: <PRODUCTION_URL>  # Replace with actual URL
           checks: health,homepage
