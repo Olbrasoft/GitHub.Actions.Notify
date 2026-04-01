@@ -1,130 +1,177 @@
 ---
 name: ci-workflow-monitor
-description: Fully autonomous CI/CD pipeline monitor. After PR creation, polls CI, review, deploy, and production verification — acts on each state change without asking. Use after creating a PR to avoid blocking on GitHub Actions.
+description: Issue-driven autonomous CI/CD pipeline. From issue analysis through implementation, PR, CI, review, merge, deploy, to Playwright production verification of issue-specific changes. Handles parent issues with multiple sub-issues and parallel PRs. NEVER asks user — acts fully autonomously.
 ---
 
-# CI Workflow Monitor
+# CI Workflow Monitor — Issue-Driven Autonomous Pipeline
 
-Fully autonomous CI/CD pipeline monitoring for Claude Code. After creating a PR, this sets up a CronCreate monitor that **acts on every state change without asking the user**.
+Fully autonomous issue-to-production pipeline. Given an issue (or parent issue with sub-issues), handles the entire lifecycle without asking the user anything.
 
 ## Critical Rules
 
-1. **NEVER ask the user** "should I merge?", "should I fix?" — just do it
-2. **NEVER send duplicate notifications** — only notify on STATE CHANGES
-3. **Act immediately** on each event — fix errors, merge PRs, verify production
-4. **Delete cron** when pipeline is complete
+1. **NEVER ask the user** — just act (merge, fix, verify, continue)
+2. **NEVER send duplicate notifications** — only on state changes
+3. **Issue-driven** — start from issue, verify issue-specific changes on production
+4. **Pipeline processing** — never wait for review, continue with next issue
+5. **Close issues** only after production verification confirms changes are visible
 
-## Workflow — Fully Autonomous
+## Workflow Overview
 
-```
-PR Created → CronCreate (every 2 min)
-  │
-  ├─ CI pending → do nothing (no notification)
-  │
-  ├─ CI FAILED → analyze error log → fix code → commit → push
-  │   └─ notify: "CI selhalo: {error}. Opravuji."
-  │
-  ├─ CI PASSED, review pending → do nothing (no notification)
-  │
-  ├─ CI PASSED, review COMMENTED/APPROVED →
-  │   ├─ Has review comments? → read comments → fix → push
-  │   │   └─ notify: "Review komentáře opraveny."
-  │   └─ No actionable comments? → MERGE PR immediately
-  │       └─ notify: "PR mergnut. Sleduji deploy."
-  │
-  ├─ PR MERGED, deploy running → do nothing (no notification)
-  │
-  ├─ DEPLOY SUCCEEDED → verify production (curl health + homepage)
-  │   └─ notify: "Deploy OK. Produkce ověřena."
-  │
-  ├─ DEPLOY FAILED → notify: "Deploy selhal! {details}"
-  │
-  └─ PRODUCTION VERIFIED → CronDelete
-      └─ notify: "Pipeline kompletní."
-```
-
-## CronCreate Prompt Template
-
-Replace `{PR_NUMBER}`, `{OWNER}/{REPO}`, `{PRODUCTION_URL}`, and `{ISSUE_IDS}` with actual values.
+### Single Issue
 
 ```
-AUTONOMOUS CI/CD pipeline monitor for {OWNER}/{REPO} PR #{PR_NUMBER}.
+Issue assigned
+  └── Implement → commit → push → create PR
+        └── CronCreate (every 2 min)
+              ├── CI pending → silent wait
+              ├── CI failed → analyze logs → fix → push
+              ├── CI passed → check review
+              │   ├── review pending → silent wait
+              │   ├── review has comments → fix → push
+              │   └── review done → MERGE
+              ├── After merge → monitor deploy
+              │   ├── deploy running → silent wait
+              │   ├── deploy failed → notify error
+              │   └── deploy succeeded → verify production
+              └── Verify production
+                    ├── Health + homepage check
+                    ├── Analyze issue → what changed?
+                    ├── Playwright: verify specific changes visible
+                    ├── Notify result
+                    └── CronDelete
+```
 
-Act fully autonomously. NEVER ask the user anything. Only notify on STATE CHANGES — no duplicate notifications.
+### Parent Issue with Sub-Issues (Pipeline Processing)
 
-Track state internally. States: CI_PENDING → CI_PASSED → REVIEW_PENDING → REVIEW_DONE → MERGING → DEPLOY_RUNNING → DEPLOY_DONE → VERIFIED → COMPLETE
+Follows [Continuous PR Processing Workflow](~/GitHub/Olbrasoft/engineering-handbook/development-guidelines/workflow/continuous-pr-processing-workflow.md):
+
+```
+Parent issue
+  ├── List sub-issues: gh api graphql (query subIssues)
+  ├── Group into logical parts (1-N issues per PR)
+  ├── Identify dependencies between parts
+  │
+  ├── Part 1: Implement sub-issues → PR1
+  │     └── CronCreate monitors PR1
+  │     └── IMMEDIATELY start Part 2 (don't wait!)
+  │
+  ├── Part 2: Implement sub-issues → PR2
+  │     └── Check PR1 status → merge if ready
+  │     └── CronCreate monitors PR2
+  │     └── Continue to Part 3
+  │
+  ├── Part N: Last sub-issues → PRN
+  │     └── Check & merge all previous PRs
+  │
+  └── All PRs merged → deploy → verify ALL changes
+        ├── For each sub-issue: verify its specific changes
+        ├── Notify per-issue verification results
+        └── Close sub-issues + parent issue
+```
+
+## CronCreate Prompt Template — Single Issue
+
+Replace `{ISSUE_NUM}`, `{PR_NUMBER}`, `{OWNER}/{REPO}`, `{PRODUCTION_URL}`, `{BRANCH}`, `{ISSUE_IDS}`.
+
+```
+AUTONOMOUS issue-driven CI/CD monitor for {OWNER}/{REPO}.
+Working on issue #{ISSUE_NUM}, PR #{PR_NUMBER}, branch {BRANCH}.
+
+Act fully autonomously. NEVER ask the user. Only notify on STATE CHANGES.
 
 ## Phase 1: CI + Review (while PR is open)
 
-1. gh pr view {PR_NUMBER} --repo {OWNER}/{REPO} --json state --jq '.state'
-   - If "MERGED" → skip to Phase 2
-   - If "CLOSED" → notify "PR uzavřen" → CronDelete → done
+1. Check PR state:
+   gh pr view {PR_NUMBER} --repo {OWNER}/{REPO} --json state --jq '.state'
+   - "MERGED" → skip to Phase 2
+   - "CLOSED" → notify "PR uzavřen" → CronDelete
 
-2. gh pr checks {PR_NUMBER} --repo {OWNER}/{REPO}
-   - If any "pending"/"in_progress" → say "CI running" (only once) → stop
-   - If any "fail" →
-     gh run list --repo {OWNER}/{REPO} --branch {BRANCH} --limit 1 --json databaseId --jq '.[0].databaseId'
+2. Check CI:
+   gh pr checks {PR_NUMBER} --repo {OWNER}/{REPO}
+   - pending → "CI running" (once) → stop
+   - fail → read logs: gh run list --repo {OWNER}/{REPO} --branch {BRANCH} --limit 1 --json databaseId --jq '.[0].databaseId'
      Then: gh run view <ID> --repo {OWNER}/{REPO} --log-failed 2>&1 | tail -50
-     Analyze the error. Fix the code. Commit and push.
-     Notify: "CI selhalo pro PR #{PR_NUMBER}. Opravuji: {brief_error}."
-   - If all "pass" → proceed to step 3
+     Analyze error. Fix code. Commit and push. Notify: "CI selhalo, opravuji: {error}"
+   - all pass → step 3
 
-3. gh pr view {PR_NUMBER} --repo {OWNER}/{REPO} --json reviewDecision,reviews
+3. Check review:
+   gh pr view {PR_NUMBER} --repo {OWNER}/{REPO} --json reviewDecision,reviews
    gh api repos/{OWNER}/{REPO}/pulls/{PR_NUMBER}/comments --jq '.[].body'
-   - If review comments exist with actionable feedback → fix code, commit, push
-     Notify: "Opravuji review komentáře pro PR #{PR_NUMBER}."
-   - If no actionable comments or review approved →
-     gh pr merge {PR_NUMBER} --repo {OWNER}/{REPO} --merge
-     Notify: "PR #{PR_NUMBER} mergnut. Sleduji deploy na produkci."
+   - Has actionable review comments → fix all, commit, push. Notify: "Review opraveny."
+   - No comments or approved → MERGE: gh pr merge {PR_NUMBER} --repo {OWNER}/{REPO} --merge
+     Notify: "PR #{PR_NUMBER} mergnut (issue #{ISSUE_NUM}). Sleduji deploy."
 
-## Phase 2: Deploy + Verify (after merge)
+## Phase 2: Deploy + Verify
 
-4. gh run list --repo {OWNER}/{REPO} --branch main --limit 1 --json status,conclusion,databaseId
-   - If status "in_progress"/"queued" → say "Deploy running" (only once) → stop
-   - If conclusion "failure" →
-     Notify: "Deploy {REPO} na produkci selhal!"
-     gh run view <ID> --repo {OWNER}/{REPO} --log-failed 2>&1 | tail -30
-     Report error details.
-   - If conclusion "success" → proceed to step 5
+4. Monitor deploy:
+   gh run list --repo {OWNER}/{REPO} --branch main --limit 1 --json status,conclusion,databaseId
+   - in_progress → "Deploy running" (once) → stop
+   - failure → Notify: "Deploy selhal!" + read logs
+   - success → step 5
 
-5. Verify production — basic health:
-   HEALTH=$(curl -s -o /dev/null -w "%{{http_code}}" --max-time 10 {PRODUCTION_URL}/health)
-   HOME=$(curl -s -o /dev/null -w "%{{http_code}}" --max-time 10 {PRODUCTION_URL}/)
-   - If not 200 → Notify: "Produkce neodpovídá! Health: $HEALTH, Homepage: $HOME" → stop
-   - If both 200 → proceed to step 6
+5. Basic health check:
+   curl -s -o /dev/null -w "%{{http_code}}" --max-time 10 {PRODUCTION_URL}/health
+   curl -s -o /dev/null -w "%{{http_code}}" --max-time 10 {PRODUCTION_URL}/
+   - not 200 → Notify: "Produkce neodpovídá!"
+   - both 200 → step 6
 
-6. Verify production — issue-specific changes:
-   Read the PR and linked issues to understand WHAT changed:
-   gh pr view {PR_NUMBER} --repo {OWNER}/{REPO} --json body,title,closedIssues
-   For each linked issue: gh issue view <ISSUE_NUM> --repo {OWNER}/{REPO} --json title,body
+6. Issue-specific verification:
+   Read the issue to understand what changed:
+   gh issue view {ISSUE_NUM} --repo {OWNER}/{REPO} --json title,body
 
-   Analyze what the issues describe (new feature, bug fix, UI change, etc.).
-   Then use Playwright MCP or curl to verify the specific changes are visible on production:
-   - If the issue added a new page/route → navigate to it, verify it loads
-   - If the issue changed UI elements → take a screenshot, verify the change
-   - If the issue fixed a bug → reproduce the original scenario, verify it's fixed
-   - If the issue changed data/content → verify the content is correct
+   Based on the issue description, verify the specific changes on production:
+   - New page/route → navigate to it, verify it loads (curl or Playwright)
+   - UI change → take screenshot, verify change is visible
+   - Bug fix → reproduce original scenario, verify it's fixed
+   - Data/content change → verify content is correct
+   - SEO change → check meta tags, URLs, redirects
 
-   Report findings for each issue. Notify:
-   "Deploy {REPO} kompletní. Ověřeno: [issue descriptions and verification results]."
-   Say: "PIPELINE COMPLETE — run CronDelete to stop this monitor."
+   Report what was verified for this issue.
+   Notify: "Issue #{ISSUE_NUM} ověřena na produkci: {verification_summary}"
+
+   Then: "PIPELINE COMPLETE — run CronDelete."
 
 Issue IDs for notifications: {ISSUE_IDS}
 ```
 
-## CronCreate Parameters
+## CronCreate Prompt Template — Parent Issue (Pipeline)
 
-```javascript
-CronCreate({
-  cron: "*/2 * * * *",   // Every 2 minutes
-  prompt: "...",          // Use template above with filled values
-  recurring: true
-})
+For parent issues, the CronCreate manages the entire pipeline:
+
+```
+AUTONOMOUS pipeline for parent issue #{PARENT_NUM} on {OWNER}/{REPO}.
+Production URL: {PRODUCTION_URL}.
+
+1. List sub-issues:
+   PARENT_ID=$(gh issue view {PARENT_NUM} --repo {OWNER}/{REPO} --json id --jq '.id')
+   gh api graphql -f query="query {{ node(id: \"$PARENT_ID\") {{ ... on Issue {{ subIssues(first: 50) {{ nodes {{ number title state }} }} }} }} }}" --jq '.data.node.subIssues.nodes[]'
+
+2. Check which sub-issues are still open.
+   For each open sub-issue: check if there's already a PR or branch.
+
+3. Track PRs:
+   gh pr list --repo {OWNER}/{REPO} --state open --json number,title,headRefName
+   Match PRs to sub-issues by branch name or title.
+
+4. For each PR:
+   - Check CI + review status (same as single issue Phase 1)
+   - If ready → merge
+   - Continue to next sub-issue
+
+5. When ALL sub-issues are closed and all PRs merged:
+   - Monitor final deploy
+   - Verify ALL changes on production (per sub-issue)
+   - Notify: "Parent issue #{PARENT_NUM} kompletní. Všechny sub-issues ověřeny."
+   - CronDelete
 ```
 
 ## Key Commands Reference
 
 ```bash
+# List sub-issues of parent
+PARENT_ID=$(gh issue view <NUM> --repo <REPO> --json id --jq '.id')
+gh api graphql -f query="query { node(id: \"$PARENT_ID\") { ... on Issue { subIssues(first: 50) { nodes { number title state } } } } }"
+
 # CI status
 gh pr checks <PR> --repo <REPO>
 
@@ -140,10 +187,13 @@ gh api repos/<OWNER>/<REPO>/pulls/<PR>/comments --jq '.[].body'
 # Merge
 gh pr merge <PR> --repo <REPO> --merge
 
-# Latest main workflow run
+# Deploy status
 gh run list --repo <REPO> --branch main --limit 1 --json status,conclusion,databaseId
 
-# Production verification
+# Issue details (for verification)
+gh issue view <NUM> --repo <REPO> --json title,body
+
+# Production checks
 curl -s -o /dev/null -w "%{http_code}" <URL>/health
 curl -s -o /dev/null -w "%{http_code}" <URL>/
 ```
@@ -152,32 +202,32 @@ curl -s -o /dev/null -w "%{http_code}" <URL>/
 
 | State | Trigger | Autonomous Action |
 |---|---|---|
+| ISSUE_ASSIGNED | start | Implement, create branch, commit, push, create PR |
 | CI_PENDING | poll | Silent wait |
-| CI_FAILED | poll | Analyze + fix + push |
+| CI_FAILED | poll | Analyze logs → fix → push |
 | CI_PASSED | poll | Check review |
 | REVIEW_PENDING | poll | Silent wait |
 | REVIEW_DONE | poll | Fix comments if any → merge |
-| MERGING | merge cmd | Notify, switch to deploy tracking |
+| PR_MERGED | poll | Monitor deploy |
 | DEPLOY_RUNNING | poll | Silent wait |
-| DEPLOY_DONE | poll | Health check → issue-specific verification |
 | DEPLOY_FAILED | poll | Notify error |
-| HEALTH_OK | poll | Analyze issues → verify changes on production via Playwright |
-| VERIFIED | poll | Notify success with per-issue results → CronDelete |
+| DEPLOY_DONE | poll | Health check + issue-specific verification |
+| VERIFIED | poll | Notify per-issue results → CronDelete |
 
 ## Anti-Patterns
 
 | Wrong | Right |
 |---|---|
 | "Chceš mergovat?" | Just merge it |
-| "CI prošlo" (every poll) | Only notify on first pass or state change |
-| Waiting for user input | Act immediately on each state |
-| Sending same notification twice | Track what was already reported |
-| Leaving cron running after completion | CronDelete when done |
+| "CI prošlo" (every poll) | Only notify on state change |
+| Waiting for review | Continue with next sub-issue |
+| Generic health check only | Verify issue-specific changes on production |
+| Closing issue before verification | First verify on production, then close |
+| One PR for entire parent issue | Split into logical parts, one PR per group |
 
-## Notes
+## Integration
 
-- CronCreate jobs are session-only (max 7 days)
-- Always send Czech notifications via mcp__notify__notify
-- Include issueIds when working on specific issues
-- For CI failures: read logs, identify root cause, fix autonomously
-- For review comments: read all comments, fix all issues, push in one commit
+This skill works with:
+- [Continuous PR Processing](~/GitHub/Olbrasoft/engineering-handbook/development-guidelines/workflow/continuous-pr-processing-workflow.md) — pipeline pattern for parent issues
+- [GitHub Issues](github-issues skill) — issue creation with proper GraphQL sub-issue linking
+- [Git Workflow](~/GitHub/Olbrasoft/engineering-handbook/development-guidelines/workflow/git-workflow-workflow.md) — branch naming, commits
