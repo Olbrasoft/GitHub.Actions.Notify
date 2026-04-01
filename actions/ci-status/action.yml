@@ -3,13 +3,13 @@ description: 'Report CI job result (pass/fail) to VirtualAssistant with context.
 
 inputs:
   job-status:
-    description: 'Job status from GitHub Actions (use ${{ job.status }})'
+    description: 'Job status: success, failure, or cancelled'
     required: true
   stage:
     description: 'CI stage name (e.g., check, format, test, build)'
     required: true
   repository:
-    description: 'Repository name (use ${{ github.repository }})'
+    description: 'Full repository name like owner/repo'
     required: true
   run-url:
     description: 'URL to the workflow run'

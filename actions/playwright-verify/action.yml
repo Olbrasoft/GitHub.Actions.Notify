@@ -14,7 +14,7 @@ inputs:
     required: false
     default: '30'
   repository:
-    description: 'Repository name (use ${{ github.repository }})'
+    description: 'Full repository name like owner/repo'
     required: false
     default: ''
   issue-ids:
