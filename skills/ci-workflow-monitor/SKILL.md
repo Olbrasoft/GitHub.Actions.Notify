@@ -157,21 +157,38 @@ Act fully autonomously. NEVER ask the user. Only notify on STATE CHANGES.
    - not 200 → Notify: "Produkce neodpovídá!"
    - both 200 → step 6
 
-6. Issue-specific verification:
+6. Issue-specific verification — MUST USE PLAYWRIGHT (not just curl):
    Read the issue to understand what changed:
    gh issue view {ISSUE_NUM} --repo {OWNER}/{REPO} --json title,body
 
-   Based on the issue description, verify the specific changes on production:
-   - New page/route → navigate to it, verify it loads (curl or Playwright)
-   - UI change → take screenshot, verify change is visible
-   - Bug fix → reproduce original scenario, verify it's fixed
-   - Data/content change → verify content is correct
-   - SEO change → check meta tags, URLs, redirects
+   **CRITICAL: You MUST open the production page in Playwright and take a screenshot.**
+   curl only checks HTTP status — it CANNOT detect broken images, missing CSS, layout issues.
+   A page can return HTTP 200 but have broken images, missing flags, wrong layout.
 
-   Report what was verified for this issue.
-   Notify: "Issue #{ISSUE_NUM} ověřena na produkci: {verification_summary}"
+   Use Playwright MCP or webapp-testing skill to:
+   a) Navigate to the relevant production page(s)
+   b) Take a screenshot
+   c) VISUALLY verify the screenshot — look at it and confirm:
+      - Images actually render (not broken image icons)
+      - Layout is correct
+      - Content matches what the issue describes
+      - No visual errors or missing elements
 
-   Then: "PIPELINE COMPLETE — run CronDelete."
+   Based on the issue description, verify specific changes:
+   - New image/flag/coat → open page, screenshot, confirm image VISUALLY renders
+   - New page/route → navigate, screenshot, confirm it loads correctly
+   - UI change → screenshot, compare with expected result
+   - Bug fix → reproduce original scenario, screenshot, confirm fix
+   - SEO change → check page source for meta tags, URLs
+
+   If verification FAILS (broken image, missing content, wrong layout):
+   - Notify: "Verifikace selhala: {what's wrong}. Opravuji."
+   - Fix the issue, create new PR, restart pipeline
+   - Do NOT close the issue
+
+   If verification PASSES:
+   - Notify: "Issue #{ISSUE_NUM} ověřena na produkci: {what was visually confirmed}"
+   - Then: "PIPELINE COMPLETE — run CronDelete."
 
 Issue IDs for notifications: {ISSUE_IDS}
 ```
