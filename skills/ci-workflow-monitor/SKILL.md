@@ -14,6 +14,25 @@ Fully autonomous issue-to-production pipeline. Given an issue (or parent issue w
 3. **Issue-driven** — start from issue, verify issue-specific changes on production
 4. **Pipeline processing** — never wait for review, continue with next issue
 5. **Close issues** only after production verification confirms changes are visible
+6. **NEVER say "issue done" after creating a PR** — issue is done ONLY after deploy + Playwright production verification confirms the changes are visible and working. Creating a PR is ~20% of the work.
+
+## When Is an Issue "Done"?
+
+An issue is complete ONLY when ALL of these are true:
+- PR merged to main
+- Deploy to production succeeded
+- Playwright verified the **specific changes from the issue** are visible on production
+- If the issue says "show photo gallery" → gallery must be visible on production
+- If the issue says "fix breadcrumb" → breadcrumb must be correct on production
+
+**Notification rules:**
+| Event | What to say | What NOT to say |
+|---|---|---|
+| PR created | "PR vytvořen, CI běží" | "Issue hotová" |
+| CI passed | "CI prošlo, čekám na review" | "Issue hotová" |
+| PR merged | "PR mergnut, sleduji deploy" | "Issue hotová" |
+| Deploy done | "Deploy OK, ověřuji produkci" | "Issue hotová" |
+| **Production verified** | **"Issue #N hotová — [co bylo ověřeno]"** | — |
 
 ## Workflow Overview
 
