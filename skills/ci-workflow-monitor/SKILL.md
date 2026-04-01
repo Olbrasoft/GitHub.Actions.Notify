@@ -119,19 +119,18 @@ Act fully autonomously. NEVER ask the user. Only notify on STATE CHANGES.
 3. Check review:
    gh pr view {PR_NUMBER} --repo {OWNER}/{REPO} --json reviewDecision,reviews
 
-   IMPORTANT: Copilot code review takes ~3-5 minutes. You MUST wait for it.
+   Branch protection requires all checks to pass before merge (including Copilot code review "Agent" check).
+   Simply attempt to merge — GitHub will reject if checks haven't passed yet.
 
-   - If reviews array is EMPTY → review has NOT arrived yet → say "Waiting for Copilot review" → STOP, wait for next tick
-   - If reviews exist AND have inline comments:
-     gh api repos/{OWNER}/{REPO}/pulls/{PR_NUMBER}/comments --jq '.[].body'
-     Fix all actionable comments, commit, push. Notify: "Review opraveny."
-   - If reviews exist with NO actionable comments (COMMENTED state, no inline comments) → MERGE
-   - If reviewDecision is "APPROVED" → MERGE
+   gh pr merge {PR_NUMBER} --repo {OWNER}/{REPO} --merge 2>&1
+   - If merge SUCCEEDS → Notify: "PR #{PR_NUMBER} mergnut (issue #{ISSUE_NUM}). Sleduji deploy."
+   - If merge FAILS with "required status checks" → checks still running → say "Merge blocked by pending checks, waiting" → STOP, wait for next tick
+   - If merge FAILS with other error → report the error
 
-   To merge: gh pr merge {PR_NUMBER} --repo {OWNER}/{REPO} --merge
-   Notify: "PR #{PR_NUMBER} mergnut (issue #{ISSUE_NUM}). Sleduji deploy."
-
-   NEVER merge when reviews is empty — that means review hasn't happened yet!
+   If merge is blocked, also check for review comments to address:
+   gh api repos/{OWNER}/{REPO}/pulls/{PR_NUMBER}/comments --jq '.[].body'
+   - Has actionable review comments → fix all, commit, push. Notify: "Review opraveny."
+   - No comments → just wait for checks to complete
 
 ## Phase 2: Deploy + Verify
 
