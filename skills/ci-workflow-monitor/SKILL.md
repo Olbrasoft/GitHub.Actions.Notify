@@ -25,14 +25,17 @@ An issue is complete ONLY when ALL of these are true:
 - If the issue says "show photo gallery" → gallery must be visible on production
 - If the issue says "fix breadcrumb" → breadcrumb must be correct on production
 
-**Notification rules:**
-| Event | What to say | What NOT to say |
+**NEVER close a GitHub issue (`gh issue close`) before Playwright production verification.** Closing = work is done and verified. If Playwright shows changes are NOT visible → fix, push, new PR, repeat the cycle.
+
+**Notification and closing rules:**
+| Event | What to say | Close issue? |
 |---|---|---|
-| PR created | "PR vytvořen, CI běží" | "Issue hotová" |
-| CI passed | "CI prošlo, čekám na review" | "Issue hotová" |
-| PR merged | "PR mergnut, sleduji deploy" | "Issue hotová" |
-| Deploy done | "Deploy OK, ověřuji produkci" | "Issue hotová" |
-| **Production verified** | **"Issue #N hotová — [co bylo ověřeno]"** | — |
+| PR created | "PR vytvořen, CI běží" | NO |
+| CI passed | "CI prošlo, čekám na review" | NO |
+| PR merged | "PR mergnut, sleduji deploy" | NO |
+| Deploy done | "Deploy OK, ověřuji produkci" | NO |
+| Production verified OK | "Issue #N hotová — [co ověřeno]" | **YES — now close** |
+| Production verification FAILED | "Změny nefungují: [problém]. Opravuji." | NO — fix and retry |
 
 ## Workflow Overview
 
