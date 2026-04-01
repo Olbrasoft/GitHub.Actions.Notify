@@ -1,0 +1,45 @@
+name: Test Actions
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-notify:
+    name: Test notify action
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test core notify action
+        uses: ./actions/notify
+        with:
+          text: "Test notifikace z GitHub.Actions.Notify CI"
+          source: ci-pipeline
+
+      - name: Test ci-status action (success)
+        uses: ./actions/ci-status
+        with:
+          job-status: success
+          stage: test
+          repository: ${{ github.repository }}
+
+      - name: Test deploy-status action (success)
+        uses: ./actions/deploy-status
+        with:
+          job-status: success
+          repository: ${{ github.repository }}
+
+  test-verify:
+    name: Test playwright-verify action
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test playwright verify (health check only)
+        uses: ./actions/playwright-verify
+        with:
+          url: http://localhost:5055
+          checks: health

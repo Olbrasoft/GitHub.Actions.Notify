@@ -1,0 +1,54 @@
+# Example CI workflow for .NET projects
+# Hybrid approach: build/test on cloud runner, deploy/verify on self-hosted runner
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - run: dotnet build -c Release
+      - run: dotnet test -c Release --no-build --filter "FullyQualifiedName!~IntegrationTests"
+
+  deploy:
+    name: Deploy to production
+    runs-on: self-hosted
+    needs: [build-and-test]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run deploy script
+        run: ./deploy/deploy.sh
+
+      - name: Notify deploy result
+        if: always()
+        uses: Olbrasoft/GitHub.Actions.Notify/actions/deploy-status@main
+        with:
+          job-status: ${{ job.status }}
+          repository: ${{ github.repository }}
+
+  verify:
+    name: Verify production
+    runs-on: self-hosted
+    needs: [deploy]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - name: Wait for service startup
+        run: sleep 10
+
+      - name: Verify production
+        uses: Olbrasoft/GitHub.Actions.Notify/actions/playwright-verify@main
+        with:
+          url: https://your-app.example.com
+          checks: health,homepage

@@ -1,0 +1,58 @@
+name: 'CI Status Notification'
+description: 'Report CI job result (pass/fail) to VirtualAssistant with context.'
+
+inputs:
+  job-status:
+    description: 'Job status from GitHub Actions (use ${{ job.status }})'
+    required: true
+  stage:
+    description: 'CI stage name (e.g., check, format, test, build)'
+    required: true
+  repository:
+    description: 'Repository name (use ${{ github.repository }})'
+    required: false
+    default: ${{ github.repository }}
+  run-url:
+    description: 'URL to the workflow run'
+    required: false
+    default: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+  issue-ids:
+    description: 'Comma-separated GitHub issue IDs'
+    required: false
+    default: ''
+  virtual-assistant-url:
+    description: 'VirtualAssistant API base URL'
+    required: false
+    default: 'http://localhost:5055'
+
+runs:
+  using: composite
+  steps:
+    - name: Build notification text
+      id: build-text
+      shell: bash
+      run: |
+        REPO="${{ inputs.repository }}"
+        REPO_SHORT="${REPO##*/}"
+        STAGE="${{ inputs.stage }}"
+        STATUS="${{ inputs.job-status }}"
+
+        if [ "$STATUS" = "success" ]; then
+          TEXT="CI pro ${REPO_SHORT}: ${STAGE} uspesne dokoncen."
+        elif [ "$STATUS" = "failure" ]; then
+          TEXT="CI pro ${REPO_SHORT}: ${STAGE} selhal. Viz ${{ inputs.run-url }}"
+        elif [ "$STATUS" = "cancelled" ]; then
+          TEXT="CI pro ${REPO_SHORT}: ${STAGE} byl zrusen."
+        else
+          TEXT="CI pro ${REPO_SHORT}: ${STAGE} skoncil se stavem ${STATUS}."
+        fi
+
+        echo "text=${TEXT}" >> "$GITHUB_OUTPUT"
+
+    - name: Send notification
+      uses: Olbrasoft/GitHub.Actions.Notify/actions/notify@main
+      with:
+        text: ${{ steps.build-text.outputs.text }}
+        source: ci-pipeline
+        issue-ids: ${{ inputs.issue-ids }}
+        virtual-assistant-url: ${{ inputs.virtual-assistant-url }}

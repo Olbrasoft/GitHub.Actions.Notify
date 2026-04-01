@@ -1,0 +1,121 @@
+name: 'Playwright Production Verification'
+description: 'Run Playwright checks against a production URL and report result to VirtualAssistant.'
+
+inputs:
+  url:
+    description: 'Production URL to verify (e.g., https://ceskarepublika.wiki)'
+    required: true
+  checks:
+    description: 'Comma-separated checks to run: health, homepage, title'
+    required: false
+    default: 'health,homepage'
+  timeout:
+    description: 'Request timeout in seconds'
+    required: false
+    default: '30'
+  repository:
+    description: 'Repository name'
+    required: false
+    default: ${{ github.repository }}
+  issue-ids:
+    description: 'Comma-separated GitHub issue IDs'
+    required: false
+    default: ''
+  virtual-assistant-url:
+    description: 'VirtualAssistant API base URL'
+    required: false
+    default: 'http://localhost:5055'
+
+runs:
+  using: composite
+  steps:
+    - name: Run production verification
+      id: verify
+      shell: bash
+      run: |
+        URL="${{ inputs.url }}"
+        CHECKS="${{ inputs.checks }}"
+        TIMEOUT="${{ inputs.timeout }}"
+        RESULTS=""
+        FAILED=0
+
+        IFS=',' read -ra CHECK_LIST <<< "$CHECKS"
+
+        for CHECK in "${CHECK_LIST[@]}"; do
+          CHECK=$(echo "$CHECK" | xargs)  # trim whitespace
+
+          case "$CHECK" in
+            health)
+              STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time "$TIMEOUT" "${URL}/health" 2>/dev/null || echo "000")
+              if [ "$STATUS" = "200" ]; then
+                RESULTS="${RESULTS}health:OK "
+                echo "::notice::Health check passed (HTTP 200)"
+              else
+                RESULTS="${RESULTS}health:FAIL(${STATUS}) "
+                FAILED=1
+                echo "::error::Health check failed (HTTP ${STATUS})"
+              fi
+              ;;
+            homepage)
+              STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time "$TIMEOUT" "${URL}/" 2>/dev/null || echo "000")
+              if [ "$STATUS" = "200" ]; then
+                RESULTS="${RESULTS}homepage:OK "
+                echo "::notice::Homepage check passed (HTTP 200)"
+              else
+                RESULTS="${RESULTS}homepage:FAIL(${STATUS}) "
+                FAILED=1
+                echo "::error::Homepage check failed (HTTP ${STATUS})"
+              fi
+              ;;
+            title)
+              TITLE=$(curl -s --max-time "$TIMEOUT" "${URL}/" 2>/dev/null | grep -oP '(?<=<title>).*?(?=</title>)' | head -1)
+              if [ -n "$TITLE" ]; then
+                RESULTS="${RESULTS}title:OK(${TITLE}) "
+                echo "::notice::Title check passed: ${TITLE}"
+              else
+                RESULTS="${RESULTS}title:FAIL "
+                FAILED=1
+                echo "::error::Title check failed — no title found"
+              fi
+              ;;
+            *)
+              echo "::warning::Unknown check: ${CHECK}"
+              ;;
+          esac
+        done
+
+        echo "results=${RESULTS}" >> "$GITHUB_OUTPUT"
+        echo "failed=${FAILED}" >> "$GITHUB_OUTPUT"
+
+    - name: Build notification text
+      id: build-text
+      shell: bash
+      run: |
+        REPO="${{ inputs.repository }}"
+        REPO_SHORT="${REPO##*/}"
+        URL="${{ inputs.url }}"
+        RESULTS="${{ steps.verify.outputs.results }}"
+        FAILED="${{ steps.verify.outputs.failed }}"
+
+        if [ "$FAILED" = "0" ]; then
+          TEXT="Playwright verifikace ${REPO_SHORT} (${URL}): vsechny kontroly prosly. ${RESULTS}"
+        else
+          TEXT="Playwright verifikace ${REPO_SHORT} (${URL}): nektere kontroly selhaly! ${RESULTS}"
+        fi
+
+        echo "text=${TEXT}" >> "$GITHUB_OUTPUT"
+
+    - name: Send notification
+      uses: Olbrasoft/GitHub.Actions.Notify/actions/notify@main
+      with:
+        text: ${{ steps.build-text.outputs.text }}
+        source: ci-pipeline
+        issue-ids: ${{ inputs.issue-ids }}
+        virtual-assistant-url: ${{ inputs.virtual-assistant-url }}
+
+    - name: Fail if verification failed
+      if: steps.verify.outputs.failed == '1'
+      shell: bash
+      run: |
+        echo "::error::Production verification failed"
+        exit 1

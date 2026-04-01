@@ -1,0 +1,57 @@
+name: 'Deploy Status Notification'
+description: 'Report deploy result to VirtualAssistant.'
+
+inputs:
+  job-status:
+    description: 'Job status from GitHub Actions (use ${{ job.status }})'
+    required: true
+  repository:
+    description: 'Repository name (use ${{ github.repository }})'
+    required: false
+    default: ${{ github.repository }}
+  environment:
+    description: 'Deployment environment name'
+    required: false
+    default: 'production'
+  run-url:
+    description: 'URL to the workflow run'
+    required: false
+    default: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+  issue-ids:
+    description: 'Comma-separated GitHub issue IDs'
+    required: false
+    default: ''
+  virtual-assistant-url:
+    description: 'VirtualAssistant API base URL'
+    required: false
+    default: 'http://localhost:5055'
+
+runs:
+  using: composite
+  steps:
+    - name: Build notification text
+      id: build-text
+      shell: bash
+      run: |
+        REPO="${{ inputs.repository }}"
+        REPO_SHORT="${REPO##*/}"
+        ENV="${{ inputs.environment }}"
+        STATUS="${{ inputs.job-status }}"
+
+        if [ "$STATUS" = "success" ]; then
+          TEXT="Deploy ${REPO_SHORT} na ${ENV} uspesne dokoncen."
+        elif [ "$STATUS" = "failure" ]; then
+          TEXT="Deploy ${REPO_SHORT} na ${ENV} selhal. Viz ${{ inputs.run-url }}"
+        else
+          TEXT="Deploy ${REPO_SHORT} na ${ENV} skoncil se stavem ${STATUS}."
+        fi
+
+        echo "text=${TEXT}" >> "$GITHUB_OUTPUT"
+
+    - name: Send notification
+      uses: Olbrasoft/GitHub.Actions.Notify/actions/notify@main
+      with:
+        text: ${{ steps.build-text.outputs.text }}
+        source: ci-pipeline
+        issue-ids: ${{ inputs.issue-ids }}
+        virtual-assistant-url: ${{ inputs.virtual-assistant-url }}

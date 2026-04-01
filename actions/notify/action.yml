@@ -1,0 +1,48 @@
+name: 'Notify VirtualAssistant'
+description: 'Send a notification to VirtualAssistant via HTTP POST. Requires self-hosted runner with access to localhost:5055.'
+
+inputs:
+  text:
+    description: 'Notification text (Czech language recommended for TTS)'
+    required: true
+  source:
+    description: 'Agent source identifier'
+    required: false
+    default: 'ci-pipeline'
+  issue-ids:
+    description: 'Comma-separated GitHub issue IDs (e.g., "123,456")'
+    required: false
+    default: ''
+  virtual-assistant-url:
+    description: 'VirtualAssistant API base URL'
+    required: false
+    default: 'http://localhost:5055'
+
+runs:
+  using: composite
+  steps:
+    - name: Send notification to VirtualAssistant
+      shell: bash
+      run: |
+        ISSUE_IDS_JSON="[]"
+        if [ -n "${{ inputs.issue-ids }}" ]; then
+          ISSUE_IDS_JSON="[${{ inputs.issue-ids }}]"
+        fi
+
+        RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+          "${{ inputs.virtual-assistant-url }}/api/notifications" \
+          -H "Content-Type: application/json" \
+          -d "{
+            \"text\": $(echo '${{ inputs.text }}' | jq -Rs .),
+            \"source\": \"${{ inputs.source }}\",
+            \"issueIds\": ${ISSUE_IDS_JSON}
+          }" 2>&1) || true
+
+        HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+        BODY=$(echo "$RESPONSE" | head -n -1)
+
+        if [ "$HTTP_CODE" = "200" ]; then
+          echo "::notice::Notification sent successfully to VirtualAssistant"
+        else
+          echo "::warning::Failed to send notification (HTTP ${HTTP_CODE}): ${BODY}"
+        fi
