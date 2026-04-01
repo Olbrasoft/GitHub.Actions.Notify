@@ -119,18 +119,26 @@ Act fully autonomously. NEVER ask the user. Only notify on STATE CHANGES.
 3. Check review:
    gh pr view {PR_NUMBER} --repo {OWNER}/{REPO} --json reviewDecision,reviews
 
-   Branch protection requires all checks to pass before merge (including Copilot code review "Agent" check).
-   Simply attempt to merge — GitHub will reject if checks haven't passed yet.
+   Branch protection requires CI checks to pass (Check & Clippy, Format, Test).
+   Copilot code review is optional — if active, wait for it; if not, proceed.
 
-   gh pr merge {PR_NUMBER} --repo {OWNER}/{REPO} --merge 2>&1
-   - If merge SUCCEEDS → Notify: "PR #{PR_NUMBER} mergnut (issue #{ISSUE_NUM}). Sleduji deploy."
-   - If merge FAILS with "required status checks" → checks still running → say "Merge blocked by pending checks, waiting" → STOP, wait for next tick
-   - If merge FAILS with other error → report the error
+   Strategy: attempt merge. If blocked by CI, wait. If CI passed, check for Copilot review.
 
-   If merge is blocked, also check for review comments to address:
-   gh api repos/{OWNER}/{REPO}/pulls/{PR_NUMBER}/comments --jq '.[].body'
-   - Has actionable review comments → fix all, commit, push. Notify: "Review opraveny."
-   - No comments → just wait for checks to complete
+   a) Attempt merge:
+      gh pr merge {PR_NUMBER} --repo {OWNER}/{REPO} --merge 2>&1
+      - If merge SUCCEEDS → Notify: "PR #{PR_NUMBER} mergnut (issue #{ISSUE_NUM}). Sleduji deploy." → Phase 2
+      - If merge FAILS with "required status checks" → CI still running → STOP, wait for next tick
+
+   b) If merge is blocked, check for Copilot review comments while waiting:
+      gh api repos/{OWNER}/{REPO}/pulls/{PR_NUMBER}/comments --jq '.[].body'
+      - Has actionable review comments → fix all, commit, push. Notify: "Review komentáře opraveny."
+      - No comments → just wait
+
+   c) If CI passed but Copilot review is still running (merge would succeed but review not done):
+      Check: gh run list --repo {OWNER}/{REPO} --workflow "Copilot code review" --branch {BRANCH} --limit 1 --json status --jq '.[0].status'
+      - "in_progress" or "queued" → say "CI passed, waiting for Copilot review" → STOP, wait for next tick
+      - "completed" → check for comments, fix if needed, then merge
+      - No Copilot workflow found (not subscribed) → merge immediately
 
 ## Phase 2: Deploy + Verify
 
