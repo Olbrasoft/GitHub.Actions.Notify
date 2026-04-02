@@ -5,6 +5,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import * as http from "node:http";
 
 const DEFAULT_PORT = 9878;
+const MAX_BODY_SIZE = 1024 * 1024; // 1 MB
 
 function parseArgs(): { port: number } {
   const args = process.argv.slice(2);
@@ -35,10 +36,16 @@ interface CiEvent {
   environment?: string;
 }
 
+const STATUS_LABELS: Record<string, string> = {
+  success: "succeeded",
+  failure: "FAILED",
+  cancelled: "cancelled",
+};
+
 function formatChannelContent(data: CiEvent): string {
   const lines: string[] = [];
 
-  const statusText = data.status === "success" ? "succeeded" : "FAILED";
+  const statusText = STATUS_LABELS[data.status] ?? data.status;
   lines.push(`${data.event}: ${statusText}`);
 
   if (data.commitMessage) {
@@ -85,14 +92,32 @@ async function main() {
     }
 
     let body = "";
+    let bodySize = 0;
+
     req.on("data", (chunk: Buffer) => {
+      bodySize += chunk.length;
+      if (bodySize > MAX_BODY_SIZE) {
+        res.writeHead(413, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Request body too large" }));
+        req.destroy();
+        return;
+      }
       body += chunk.toString();
     });
 
     req.on("end", async () => {
-      try {
-        const data: CiEvent = JSON.parse(body);
+      if (bodySize > MAX_BODY_SIZE) return;
 
+      let data: CiEvent;
+      try {
+        data = JSON.parse(body);
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Invalid JSON" }));
+        return;
+      }
+
+      try {
         if (!data.event || !data.status || !data.repository) {
           res.writeHead(400, { "Content-Type": "application/json" });
           res.end(
@@ -111,6 +136,7 @@ async function main() {
         };
 
         if (data.commit) meta.commit = data.commit;
+        if (data.commitMessage) meta.commitMessage = data.commitMessage;
         if (data.environment) meta.environment = data.environment;
         if (data.runUrl) meta.runUrl = data.runUrl;
         if (data.issueIds && data.issueIds.length > 0) {
@@ -123,7 +149,6 @@ async function main() {
             params: { content, meta },
           });
         } catch {
-          // Claude Code may not be connected yet — that's OK
           console.error(
             "[ci-channel] Warning: could not push to Claude Code (not connected?)"
           );
@@ -131,9 +156,10 @@ async function main() {
 
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true, event: data.event }));
-      } catch {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Invalid JSON" }));
+      } catch (err) {
+        console.error("[ci-channel] Unexpected error:", err);
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Internal server error" }));
       }
     });
   });

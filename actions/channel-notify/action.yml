@@ -57,24 +57,37 @@ runs:
           RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
         fi
 
+        # Build validated issue IDs array using jq
         ISSUE_IDS_JSON="[]"
         if [ -n "${{ inputs.issue-ids }}" ]; then
-          ISSUE_IDS_JSON="[${{ inputs.issue-ids }}]"
+          ISSUE_IDS_JSON=$(echo "${{ inputs.issue-ids }}" | tr ',' '\n' | grep -E '^[0-9]+$' | jq -s '.' 2>/dev/null || echo "[]")
         fi
+
+        # Build JSON payload safely with jq
+        PAYLOAD=$(jq -n \
+          --arg event "${{ inputs.event }}" \
+          --arg status "${{ inputs.status }}" \
+          --arg repository "${{ inputs.repository }}" \
+          --arg commit "$COMMIT" \
+          --arg commitMessage "$COMMIT_MSG" \
+          --arg runUrl "$RUN_URL" \
+          --argjson issueIds "$ISSUE_IDS_JSON" \
+          --arg environment "${{ inputs.environment }}" \
+          '{
+            event: $event,
+            status: $status,
+            repository: $repository,
+            commit: $commit,
+            commitMessage: $commitMessage,
+            runUrl: $runUrl,
+            issueIds: $issueIds,
+            environment: $environment
+          }')
 
         RESPONSE=$(curl -s -w "\n%{http_code}" --connect-timeout 2 --max-time 5 \
           -X POST "http://127.0.0.1:${{ inputs.port }}" \
           -H "Content-Type: application/json" \
-          -d "{
-            \"event\": \"${{ inputs.event }}\",
-            \"status\": \"${{ inputs.status }}\",
-            \"repository\": \"${{ inputs.repository }}\",
-            \"commit\": \"${COMMIT}\",
-            \"commitMessage\": $(echo "${COMMIT_MSG}" | jq -Rs .),
-            \"runUrl\": \"${RUN_URL}\",
-            \"issueIds\": ${ISSUE_IDS_JSON},
-            \"environment\": \"${{ inputs.environment }}\"
-          }" 2>&1) || true
+          -d "$PAYLOAD" 2>&1) || true
 
         HTTP_CODE=$(echo "$RESPONSE" | tail -1)
 

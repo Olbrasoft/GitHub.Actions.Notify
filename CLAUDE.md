@@ -37,10 +37,14 @@ GitHub Actions (self-hosted runner)
 
 Each project gets a unique port from `~/.config/claude-channels/ports.json`:
 ```bash
-# Assign port for a project
+# 1. Build the Channel server (one-time)
+cd ~/Olbrasoft/GitHub.Actions.Notify/channel-server
+npm ci && npm run build
+
+# 2. Assign port for a project
 ./scripts/assign-port.sh Olbrasoft/VirtualAssistant  # → 9878
 
-# Configure MCP for the project (run in project directory)
+# 3. Configure MCP for the project (run in project directory)
 claude mcp add --scope local ci-channel -- \
   node ~/Olbrasoft/GitHub.Actions.Notify/channel-server/dist/index.js --port 9878
 ```

@@ -17,6 +17,12 @@ if [ $# -lt 1 ]; then
   exit 1
 fi
 
+# Check prerequisites
+if ! command -v jq &> /dev/null; then
+  echo "Error: jq is required but not installed. Install with: sudo apt install jq" >&2
+  exit 1
+fi
+
 REPO="$1"
 
 # Create registry if it doesn't exist
@@ -24,6 +30,10 @@ mkdir -p "$REGISTRY_DIR"
 if [ ! -f "$REGISTRY_FILE" ]; then
   echo "{}" > "$REGISTRY_FILE"
 fi
+
+# Use flock for concurrency safety
+exec 200>"${REGISTRY_FILE}.lock"
+flock 200
 
 # Check if project already has a port
 EXISTING_PORT=$(jq -r --arg repo "$REPO" '.[$repo] // empty' "$REGISTRY_FILE")
@@ -38,6 +48,13 @@ NEXT_PORT=$(jq -r '[.[] | tonumber] | if length == 0 then '"$BASE_PORT"' else (m
 
 if [ "$NEXT_PORT" -gt "$MAX_PORT" ]; then
   echo "Error: No available ports (max $MAX_PORT reached)" >&2
+  exit 1
+fi
+
+# Verify port is not already assigned to another project (collision check)
+COLLISION=$(jq -r --argjson port "$NEXT_PORT" 'to_entries[] | select(.value == $port) | .key' "$REGISTRY_FILE")
+if [ -n "$COLLISION" ]; then
+  echo "Error: Port $NEXT_PORT already assigned to $COLLISION" >&2
   exit 1
 fi
 
