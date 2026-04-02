@@ -166,19 +166,45 @@ Act fully autonomously. NEVER ask the user. Only notify on STATE CHANGES.
    - Verify HTML contains expected src/alt/title attributes (grep)
    - Verify no old numeric-ID URLs remain in HTML
 
-   **Step B — Playwright visual verification** (MANDATORY, final check):
-   Open the production page in Playwright, take a screenshot, and VISUALLY confirm:
-   - Images actually render (not broken image icons)
-   - Layout is correct
-   - Content matches what the issue describes
-   - No visual errors or missing elements
+   **Step B — Playwright interactive end-to-end test** (MANDATORY, final check):
+
+   Playwright runs from our LOCAL PC against production URL. NEVER install Playwright/Chromium on the server.
+
+   Open the production page in Playwright and perform a FULL interactive test — not just a screenshot.
+   The test must simulate what a real user would do:
+
+   **For static pages (displaying data):**
+   - Navigate to URL, wait for content to load
+   - Verify expected elements are visible (images render, text correct, layout OK)
+   - Take screenshot as proof
+
+   **For interactive features (forms, buttons, downloads):**
+   - Navigate to the page
+   - Fill inputs with test data
+   - Click buttons and wait for results
+   - Verify the result is correct (preview appears, data loads, download starts)
+   - Take screenshot at each step
+   - Example: video download page → paste URL → click "Načíst info" → verify preview → click "Stáhnout" → verify download
+
+   **For API features:**
+   - First test API directly via curl (quick sanity check)
+   - Then test the full user flow via Playwright UI
 
    Based on the issue description, verify specific changes:
    - New image/flag/coat → screenshot, confirm image visually renders
    - New page/route → navigate, screenshot, confirm it loads
    - UI change → screenshot, compare with expected result
-   - Bug fix → reproduce, screenshot, confirm fix
+   - Interactive feature → full user flow test (fill, click, verify result)
+   - Bug fix → reproduce original scenario, screenshot, confirm fix
    - SEO change → check page source + visual appearance
+
+   **MANDATORY: Test ALL UI elements on changed pages:**
+   - Click every button and verify its effect
+   - Toggle every switch and verify both states
+   - Fill every input and verify validation
+   - Check every link (href, target)
+   - Disabled/non-functional controls must NOT be shown
+   - Capture console errors: `page.on('console')` + `page.on('pageerror')` — must be ZERO
 
    If verification FAILS (broken image, missing content, wrong layout):
    - Notify: "Verifikace selhala: {what's wrong}. Opravuji."
@@ -256,21 +282,71 @@ curl -s -o /dev/null -w "%{http_code}" <URL>/health
 curl -s -o /dev/null -w "%{http_code}" <URL>/
 ```
 
+## Channel MCP Push Events (Primary — Instant Feedback)
+
+When a project has Channel MCP configured (ci-channel server on assigned port), GitHub Actions sends push events directly to the Claude Code session. **This replaces CronCreate polling for deploy monitoring.**
+
+### How it works
+
+After PR merge, GitHub Actions deploys and sends a Channel push event:
+```xml
+<channel source="ci-channel" event="deploy-complete" status="success" repository="Olbrasoft/VirtualAssistant" commit="f2dcb0f" environment="production">
+deploy-complete: succeeded
+Commit: fix: resolve concurrency crash (f2dcb0f)
+Run: https://github.com/Olbrasoft/VirtualAssistant/actions/runs/123
+Issues: 878
+</channel>
+```
+
+### How to react to Channel events
+
+| Channel event | status | Action |
+|---|---|---|
+| `ci-complete` | `success` | Check review, merge if ready |
+| `ci-complete` | `failure` | Analyze logs (`gh run view --log-failed`), fix, push |
+| `deploy-complete` | `success` | Verify deployment: health check + Playwright → notify user via `mcp__notify__notify` |
+| `deploy-complete` | `failure` | Notify user: "Deploy selhal!" with run URL |
+| `verify-complete` | `success` | Notify user, close issue |
+| `verify-complete` | `failure` | Analyze failure, fix, create new PR |
+
+### When Channel is received for deploy-complete/success:
+
+1. Verify service is running: `systemctl --user status <service>` or `curl <url>/health`
+2. Check logs for errors: `journalctl --user -u <service> --since "2 min ago"`
+3. Run issue-specific Playwright verification (same as Phase 2 step 6)
+4. Notify user via `mcp__notify__notify`: "Nasazení ověřeno: [details]"
+5. Close issue if verification passed
+
+### CronCreate as fallback
+
+CronCreate polling is still used for **CI + review monitoring** (Phase 1), where no Channel event is sent. Channel events are primarily for **deploy results** (Phase 2), which was the unreliable part of polling.
+
+If Channel MCP is not configured for a project, use full CronCreate polling as before.
+
 ## State Machine
 
 | State | Trigger | Autonomous Action |
 |---|---|---|
 | ISSUE_ASSIGNED | start | Implement, create branch, commit, push, create PR |
 | CI_PENDING | poll | Silent wait |
-| CI_FAILED | poll | Analyze logs → fix → push |
-| CI_PASSED | poll | Check review |
+| CI_FAILED | poll/channel | Analyze logs → fix → push |
+| CI_PASSED | poll/channel | Check review |
 | REVIEW_PENDING | poll | Silent wait |
 | REVIEW_DONE | poll | Fix comments if any → merge |
-| PR_MERGED | poll | Monitor deploy |
-| DEPLOY_RUNNING | poll | Silent wait |
-| DEPLOY_FAILED | poll | Notify error |
-| DEPLOY_DONE | poll | Health check + issue-specific verification |
-| VERIFIED | poll | Notify per-issue results → CronDelete |
+| PR_MERGED | poll → channel | Monitor deploy (Channel takes over after merge) |
+| DEPLOY_RUNNING | channel | Silent wait |
+| DEPLOY_FAILED | channel | Notify error |
+| DEPLOY_DONE | channel | Health check + issue-specific verification |
+| VERIFIED | channel | Notify per-issue results → close issue |
+
+## Server / Docker Rules
+
+- Docker image MUST be minimal — only production binary + static assets + data
+- NEVER install testing tools (Playwright, Chromium, Selenium) in Docker image
+- NEVER install Python or pip in Docker image unless required by production code (e.g., yt-dlp)
+- All Playwright testing runs from the local development PC against the production URL
+- If a feature needs a subprocess tool (e.g., yt-dlp), that is a PRODUCTION dependency — OK to install
+- If a tool is only for testing — it stays on the local PC, NOT in Docker
 
 ## Anti-Patterns
 
@@ -282,6 +358,9 @@ curl -s -o /dev/null -w "%{http_code}" <URL>/
 | Generic health check only | Verify issue-specific changes on production |
 | Closing issue before verification | First verify on production, then close |
 | One PR for entire parent issue | Split into logical parts, one PR per group |
+| Playwright screenshot only | Full interactive test (fill, click, verify) |
+| Installing Playwright in Docker | Playwright runs from local PC only |
+| curl test = done | curl + full Playwright interactive test = done |
 
 ## Integration
 
