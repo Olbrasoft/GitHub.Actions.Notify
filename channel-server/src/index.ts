@@ -1,0 +1,159 @@
+#!/usr/bin/env node
+
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import * as http from "node:http";
+
+const DEFAULT_PORT = 9878;
+
+function parseArgs(): { port: number } {
+  const args = process.argv.slice(2);
+  let port = DEFAULT_PORT;
+
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--port" && args[i + 1]) {
+      port = parseInt(args[i + 1], 10);
+      if (isNaN(port) || port < 1024 || port > 65535) {
+        console.error(`Invalid port: ${args[i + 1]}. Using default ${DEFAULT_PORT}.`);
+        port = DEFAULT_PORT;
+      }
+      i++;
+    }
+  }
+
+  return { port };
+}
+
+interface CiEvent {
+  event: string;
+  status: string;
+  repository: string;
+  commit?: string;
+  commitMessage?: string;
+  runUrl?: string;
+  issueIds?: number[];
+  environment?: string;
+}
+
+function formatChannelContent(data: CiEvent): string {
+  const lines: string[] = [];
+
+  const statusText = data.status === "success" ? "succeeded" : "FAILED";
+  lines.push(`${data.event}: ${statusText}`);
+
+  if (data.commitMessage) {
+    lines.push(`Commit: ${data.commitMessage} (${data.commit || "unknown"})`);
+  }
+
+  if (data.runUrl) {
+    lines.push(`Run: ${data.runUrl}`);
+  }
+
+  if (data.issueIds && data.issueIds.length > 0) {
+    lines.push(`Issues: ${data.issueIds.join(", ")}`);
+  }
+
+  return lines.join("\n");
+}
+
+async function main() {
+  const { port } = parseArgs();
+
+  const server = new Server(
+    { name: "ci-channel", version: "1.0.0" },
+    {
+      capabilities: {
+        experimental: { "claude/channel": {} },
+      },
+      instructions:
+        "CI/CD deployment events arrive as <channel> messages. " +
+        "When you receive a deploy-complete event with status success, " +
+        "verify the deployment (check service status, logs) and notify the user via mcp__notify__notify. " +
+        "When status is failure, notify the user about the failed deployment with the run URL.",
+    }
+  );
+
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+
+  // HTTP webhook listener
+  const httpServer = http.createServer(async (req, res) => {
+    if (req.method !== "POST") {
+      res.writeHead(405, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Method not allowed" }));
+      return;
+    }
+
+    let body = "";
+    req.on("data", (chunk: Buffer) => {
+      body += chunk.toString();
+    });
+
+    req.on("end", async () => {
+      try {
+        const data: CiEvent = JSON.parse(body);
+
+        if (!data.event || !data.status || !data.repository) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              error: "Missing required fields: event, status, repository",
+            })
+          );
+          return;
+        }
+
+        const content = formatChannelContent(data);
+        const meta: Record<string, string> = {
+          event: data.event,
+          status: data.status,
+          repository: data.repository,
+        };
+
+        if (data.commit) meta.commit = data.commit;
+        if (data.environment) meta.environment = data.environment;
+        if (data.runUrl) meta.runUrl = data.runUrl;
+        if (data.issueIds && data.issueIds.length > 0) {
+          meta.issueIds = data.issueIds.join(",");
+        }
+
+        try {
+          await server.notification({
+            method: "notifications/claude/channel",
+            params: { content, meta },
+          });
+        } catch {
+          // Claude Code may not be connected yet — that's OK
+          console.error(
+            "[ci-channel] Warning: could not push to Claude Code (not connected?)"
+          );
+        }
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, event: data.event }));
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Invalid JSON" }));
+      }
+    });
+  });
+
+  httpServer.listen(port, "127.0.0.1", () => {
+    console.error(`[ci-channel] Webhook listening on http://127.0.0.1:${port}`);
+  });
+
+  httpServer.on("error", (err: NodeJS.ErrnoException) => {
+    if (err.code === "EADDRINUSE") {
+      console.error(
+        `[ci-channel] Port ${port} already in use. Another Claude Code session may be running for this project.`
+      );
+      process.exit(1);
+    }
+    console.error(`[ci-channel] Server error: ${err.message}`);
+  });
+}
+
+main().catch((err) => {
+  console.error(`[ci-channel] Fatal error: ${err}`);
+  process.exit(1);
+});
