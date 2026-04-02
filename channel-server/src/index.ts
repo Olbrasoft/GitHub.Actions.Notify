@@ -170,12 +170,14 @@ async function main() {
 
   httpServer.on("error", (err: NodeJS.ErrnoException) => {
     if (err.code === "EADDRINUSE") {
+      // Port already in use — another session's server is running.
+      // Continue without HTTP listener (MCP stdio still works for health checks).
       console.error(
-        `[ci-channel] Port ${port} already in use. Another Claude Code session may be running for this project.`
+        `[ci-channel] Port ${port} already in use — running in MCP-only mode (no webhook listener).`
       );
-      process.exit(1);
+    } else {
+      console.error(`[ci-channel] Server error: ${err.message}`);
     }
-    console.error(`[ci-channel] Server error: ${err.message}`);
   });
 }
 
