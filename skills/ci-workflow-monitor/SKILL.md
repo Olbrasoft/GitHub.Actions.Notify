@@ -44,24 +44,23 @@ An issue is complete ONLY when ALL of these are true:
 ```
 Issue assigned
   └── Implement → commit → push → create PR
-        └── CronCreate (every 2 min)
-              ├── CI pending → silent wait
-              ├── CI failed → analyze logs → fix → push
-              ├── CI passed → check review
-              │   ├── review pending → silent wait
-              │   ├── review has comments → fix → push
-              │   └── review done → MERGE
-              ├── After merge → monitor deploy
-              │   ├── deploy running → silent wait
-              │   ├── deploy failed → notify error
-              │   └── deploy succeeded → verify production
-              └── Verify production
-                    ├── Health + homepage check
-                    ├── Analyze issue → what changed?
-                    ├── Playwright: verify specific changes visible
-                    ├── Notify result
-                    └── CronDelete
+        ├── WAIT for code review push notification (asyncRewake hook)
+        │     ├── review has comments → fix → push → wait for next review push
+        │     └── review clean → MERGE
+        ├── WAIT for deploy push notification (asyncRewake hook)
+        │     ├── deploy failed → notify error
+        │     └── deploy succeeded → verify production
+        └── Verify production
+              ├── Health + homepage check
+              ├── Analyze issue → what changed?
+              ├── Playwright: verify specific changes visible
+              └── Notify result
 ```
+
+**Push notifications arrive automatically** — no CronCreate polling needed:
+- **Code review:** `gh webhook forward` service → `webhook-receiver.py` → event file → asyncRewake wakes Claude Code
+- **Deploy:** GitHub Actions writes event file → asyncRewake wakes Claude Code
+- Claude Code wakes from idle state and reacts immediately
 
 ### Parent Issue with Sub-Issues (Pipeline Processing)
 
@@ -74,12 +73,12 @@ Parent issue
   ├── Identify dependencies between parts
   │
   ├── Part 1: Implement sub-issues → PR1
-  │     └── CronCreate monitors PR1
+  │     └── WAIT for review + deploy push notifications
   │     └── IMMEDIATELY start Part 2 (don't wait!)
   │
   ├── Part 2: Implement sub-issues → PR2
   │     └── Check PR1 status → merge if ready
-  │     └── CronCreate monitors PR2
+  │     └── WAIT for review + deploy push notifications
   │     └── Continue to Part 3
   │
   ├── Part N: Last sub-issues → PRN
@@ -91,9 +90,14 @@ Parent issue
         └── Close sub-issues + parent issue
 ```
 
-## CronCreate Prompt Template — Single Issue
+## DEPRECATED: CronCreate Prompt Templates
 
-Replace `{ISSUE_NUM}`, `{PR_NUMBER}`, `{OWNER}/{REPO}`, `{PRODUCTION_URL}`, `{BRANCH}`, `{ISSUE_IDS}`.
+**CronCreate polling is NO LONGER USED.** Push notifications via asyncRewake hooks replaced it.
+Code review and deploy events arrive automatically — no polling needed.
+
+The templates below are kept only as historical reference. Do NOT use CronCreate for new work.
+
+### Old CronCreate Prompt Template — Single Issue (DEPRECATED)
 
 ```
 AUTONOMOUS issue-driven CI/CD monitor for {OWNER}/{REPO}.
@@ -218,9 +222,7 @@ Act fully autonomously. NEVER ask the user. Only notify on STATE CHANGES.
 Issue IDs for notifications: {ISSUE_IDS}
 ```
 
-## CronCreate Prompt Template — Parent Issue (Pipeline)
-
-For parent issues, the CronCreate manages the entire pipeline:
+### Old CronCreate Prompt Template — Parent Issue (DEPRECATED)
 
 ```
 AUTONOMOUS pipeline for parent issue #{PARENT_NUM} on {OWNER}/{REPO}.
@@ -282,62 +284,54 @@ curl -s -o /dev/null -w "%{http_code}" <URL>/health
 curl -s -o /dev/null -w "%{http_code}" <URL>/
 ```
 
-## Channel MCP Push Events (Primary — Instant Feedback)
+## Push-Based Notifications (asyncRewake Hooks)
 
-When a project has Channel MCP configured (ci-channel server on assigned port), GitHub Actions sends push events directly to the Claude Code session. **This replaces CronCreate polling for deploy monitoring.**
+Push notifications arrive automatically via two mechanisms. **No CronCreate polling needed.**
 
-### How it works
+### Deploy Notification
+GitHub Actions writes event file after deploy → `watch-deploy-events.sh` (asyncRewake) detects file → wakes Claude Code from idle.
 
-After PR merge, GitHub Actions deploys and sends a Channel push event:
-```xml
-<channel source="ci-channel" event="deploy-complete" status="success" repository="Olbrasoft/VirtualAssistant" commit="f2dcb0f" environment="production">
-deploy-complete: succeeded
-Commit: fix: resolve concurrency crash (f2dcb0f)
-Run: https://github.com/Olbrasoft/VirtualAssistant/actions/runs/123
-Issues: 878
-</channel>
-```
+### Code Review Notification
+`gh webhook forward` service receives `pull_request_review` events via WebSocket → `webhook-receiver.py` writes event file → `watch-deploy-events.sh` (asyncRewake) detects file → wakes Claude Code from idle.
 
-### How to react to Channel events
+### How to react to push events
 
-| Channel event | status | Action |
+When Claude Code wakes from asyncRewake, the Stop hook injects event details via stderr. React based on event type:
+
+| Event | Status | Action |
 |---|---|---|
-| `ci-complete` | `success` | Check review, merge if ready |
-| `ci-complete` | `failure` | Analyze logs (`gh run view --log-failed`), fix, push |
-| `deploy-complete` | `success` | Verify deployment: health check + Playwright → notify user via `mcp__notify__notify` |
-| `deploy-complete` | `failure` | Notify user: "Deploy selhal!" with run URL |
-| `verify-complete` | `success` | Notify user, close issue |
-| `verify-complete` | `failure` | Analyze failure, fix, create new PR |
+| `code-review-complete` | `commented` | Read comments: `gh api repos/{REPO}/pulls/{PR}/comments --jq '.[].body'`. Fix ALL issues. Push. |
+| `deploy-complete` | `success` | Verify: `curl <url>/health`. Run Playwright verification. Notify user via `mcp__notify__notify`. |
+| `deploy-complete` | `failure` | Notify user: "Deploy selhal!" with run URL. |
 
-### When Channel is received for deploy-complete/success:
+### After deploy-complete/success:
 
-1. Verify service is running: `systemctl --user status <service>` or `curl <url>/health`
-2. Check logs for errors: `journalctl --user -u <service> --since "2 min ago"`
-3. Run issue-specific Playwright verification (same as Phase 2 step 6)
-4. Notify user via `mcp__notify__notify`: "Nasazení ověřeno: [details]"
-5. Close issue if verification passed
+1. Verify production: `curl -s -o /dev/null -w "%{http_code}" <PRODUCTION_URL>/health`
+2. Run issue-specific Playwright verification
+3. Notify user via `mcp__notify__notify`: "Issue #N ověřena na produkci: [details]"
+4. Close issue if verification passed
 
-### CronCreate as fallback
+### Infrastructure (global, already configured)
 
-CronCreate polling is still used for **CI + review monitoring** (Phase 1), where no Channel event is sent. Channel events are primarily for **deploy results** (Phase 2), which was the unreliable part of polling.
-
-If Channel MCP is not configured for a project, use full CronCreate polling as before.
+- `~/.claude/hooks/watch-deploy-events.sh` — asyncRewake watcher with flock (per-repo filtered)
+- `~/.claude/hooks/check-deploy-status.sh` — UserPromptSubmit fallback reader
+- `~/.config/claude-channels/deploy-events/` — event files directory
+- `gh-webhook-forward.service` — systemd service forwarding webhooks for all Olbrasoft repos
+- `~/.claude/hooks/webhook-receiver.py` — HTTP server on port 9877
 
 ## State Machine
 
 | State | Trigger | Autonomous Action |
 |---|---|---|
 | ISSUE_ASSIGNED | start | Implement, create branch, commit, push, create PR |
-| CI_PENDING | poll | Silent wait |
-| CI_FAILED | poll/channel | Analyze logs → fix → push |
-| CI_PASSED | poll/channel | Check review |
-| REVIEW_PENDING | poll | Silent wait |
-| REVIEW_DONE | poll | Fix comments if any → merge |
-| PR_MERGED | poll → channel | Monitor deploy (Channel takes over after merge) |
-| DEPLOY_RUNNING | channel | Silent wait |
-| DEPLOY_FAILED | channel | Notify error |
-| DEPLOY_DONE | channel | Health check + issue-specific verification |
-| VERIFIED | channel | Notify per-issue results → close issue |
+| CI_PENDING | — | Silent wait (CI runs on GitHub cloud) |
+| CI_FAILED | — | Analyze logs → fix → push |
+| CI_PASSED | — | Wait for review push notification |
+| REVIEW_COMPLETE | push (asyncRewake) | Read comments, fix if any → merge |
+| PR_MERGED | — | Wait for deploy push notification |
+| DEPLOY_COMPLETE | push (asyncRewake) | Verify production (health + Playwright) |
+| DEPLOY_FAILED | push (asyncRewake) | Notify error |
+| VERIFIED | after Playwright | Notify per-issue results → close issue |
 
 ## Server / Docker Rules
 
