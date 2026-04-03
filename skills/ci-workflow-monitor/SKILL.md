@@ -58,9 +58,10 @@ Issue assigned
 ```
 
 **Push notifications arrive automatically** — no CronCreate polling needed:
-- **Code review:** `gh webhook forward` service → `webhook-receiver.py` → event file → asyncRewake wakes Claude Code
-- **Deploy:** GitHub Actions writes event file → asyncRewake wakes Claude Code
+- **Code review:** `gh webhook forward` service → `webhook-receiver.py` → event file + FIFO wake → correct Claude Code session wakes (routed by PR branch)
+- **Deploy:** GitHub Actions writes event file + calls `wake-claude.sh` → ALL Claude Code sessions for the repo wake
 - Claude Code wakes from idle state and reacts immediately
+- Each session creates a FIFO pipe — zero CPU while waiting
 
 ### Parent Issue with Sub-Issues (Pipeline Processing)
 
@@ -284,25 +285,53 @@ curl -s -o /dev/null -w "%{http_code}" <URL>/health
 curl -s -o /dev/null -w "%{http_code}" <URL>/
 ```
 
-## Push-Based Notifications (asyncRewake Hooks)
+## FIFO-Based Push Wake Notifications
 
-Push notifications arrive automatically via two mechanisms. **No CronCreate polling needed.**
+Push notifications arrive automatically via FIFO pipes. **No CronCreate polling needed. No inotifywait. No flock.**
+
+### Architecture
+```
+Webhook arrives → webhook-receiver.py → writes event file + writes to FIFO → Claude Code wakes
+Deploy completes → GitHub Actions → writes event file + calls wake-claude.sh → Claude Code wakes
+```
+
+Each Claude Code session creates a FIFO pipe at `/tmp/claude-wake/{REPO}/{PID}.fifo` and blocks on `read` — zero CPU. External processes write to the FIFO to wake the session.
 
 ### Deploy Notification
-GitHub Actions writes event file after deploy → `watch-deploy-events.sh` (asyncRewake) detects file → wakes Claude Code from idle.
+GitHub Actions writes event file after deploy → calls `wake-claude.sh` → wakes ALL Claude Code sessions for the repo.
 
 ### Code Review Notification
-`gh webhook forward` service receives `pull_request_review` events via WebSocket → `webhook-receiver.py` writes event file → `watch-deploy-events.sh` (asyncRewake) detects file → wakes Claude Code from idle.
+`gh webhook forward` service receives `pull_request_review` events via WebSocket → `webhook-receiver.py` writes event file → calls `wake-claude.sh` with branch parameter → wakes ONLY the session working on that PR's branch.
+
+### Event Routing
+- **Code review:** Routed by PR branch name. Session on `feat/xyz` gets woken only for reviews of `feat/xyz`.
+- **Deploy:** ALL sessions for the repo. Deploy affects everyone.
 
 ### How to react to push events
 
-When Claude Code wakes from asyncRewake, the Stop hook injects event details via stderr. React based on event type:
+When Claude Code wakes from FIFO push, `wake-on-event.sh` reads event files and outputs instructions via stderr. React based on event type:
 
 | Event | Status | Action |
 |---|---|---|
 | `code-review-complete` | `commented` | Read comments: `gh api repos/{REPO}/pulls/{PR}/comments --jq '.[].body'`. Fix ALL issues. Push. |
 | `deploy-complete` | `success` | Verify: `curl <url>/health`. Run Playwright verification. Notify user via `mcp__notify__notify`. |
-| `deploy-complete` | `failure` | Notify user: "Deploy selhal!" with run URL. |
+| `deploy-complete` | `failure` | Check `failedStep` field (see below). Read logs, fix, push. Notify user. |
+| `deploy-complete` | `cancelled` | Notify user: "Deploy zrušen." Investigate and re-run if needed. |
+| `verify-complete` | `success` | Production verified by CI. Run issue-specific Playwright test. Close issue if OK. |
+| `verify-complete` | `failure` | Notify user. Investigate and fix. |
+| `verify-complete` | `cancelled` | Notify user: "Verifikace zrušena." Investigate and re-run if needed. |
+
+### Deploy failure — failedStep detection
+
+When `deploy-complete` has `status: failure`, the `failedStep` field tells you which step failed:
+
+| failedStep | Meaning | How to fix |
+|---|---|---|
+| `validate` | Missing secrets (VPS_HOST, VPS_SSH_KEY, VPS_SSH_PORT) | Check repository secrets in GitHub Settings |
+| `sync` | rsync to VPS failed (network, SSH, disk space) | Check VPS connectivity: `ssh -p 2222 root@<VPS_HOST> echo ok` |
+| `build-restart` | Docker build or restart failed on VPS | Read logs: `gh run view <ID> --log-failed`. SSH to VPS and check: `docker compose logs web` |
+| `health-check` | Health check failed after deploy (public URL not responding) | Check: `curl https://ceskarepublika.wiki/health`. SSH to VPS: `docker compose logs web` |
+| (empty) | No specific step detected as failed | Read full job logs: `gh run view <ID> --log-failed` |
 
 ### After deploy-complete/success:
 
@@ -313,11 +342,13 @@ When Claude Code wakes from asyncRewake, the Stop hook injects event details via
 
 ### Infrastructure (global, already configured)
 
-- `~/.claude/hooks/watch-deploy-events.sh` — asyncRewake watcher with flock (per-repo filtered)
+- `~/.claude/hooks/wake-on-event.sh` — FIFO-based asyncRewake hook (creates FIFO, blocks on read, processes events)
+- `~/.claude/hooks/wake-claude.sh` — Wake script (finds matching FIFOs by repo/branch, writes to them)
 - `~/.claude/hooks/check-deploy-status.sh` — UserPromptSubmit fallback reader
+- `~/.claude/hooks/webhook-receiver.py` — HTTP server on port 9877 (parses webhooks, writes events, calls wake-claude.sh)
 - `~/.config/claude-channels/deploy-events/` — event files directory
+- `/tmp/claude-wake/{REPO}/` — FIFO pipes and session registrations
 - `gh-webhook-forward.service` — systemd service forwarding webhooks for all Olbrasoft repos
-- `~/.claude/hooks/webhook-receiver.py` — HTTP server on port 9877
 
 ## State Machine
 

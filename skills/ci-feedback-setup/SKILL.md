@@ -7,7 +7,7 @@ description: Set up CI/CD feedback infrastructure for any Olbrasoft project. Reg
 
 One-time setup skill that integrates CI/CD feedback into the current project. After running this skill, the project will have:
 - TTS notifications from GitHub Actions (build, deploy, verify results)
-- CronCreate-based pipeline monitoring via `ci-workflow-monitor` skill
+- FIFO-based push wake notifications via `ci-workflow-monitor` skill
 - Post-deploy Playwright production verification
 
 ## Prerequisites
@@ -65,13 +65,38 @@ Read the existing `.github/workflows/ci.yml` (or equivalent) and add:
     runs-on: self-hosted  # Changed from ubuntu-latest
     # ... existing steps ...
 
-    # ADD at the end:
-    - name: Notify deploy result
+    # ADD: Write deploy event file + wake Claude Code via FIFO
+    - name: Write deploy event for Claude Code
       if: always()
-      uses: Olbrasoft/GitHub.Actions.Notify/actions/deploy-status@v1
-      with:
-        job-status: ${{ job.status }}
-        repository: ${{ github.repository }}
+      continue-on-error: true
+      shell: bash
+      run: |
+        EVENTS_DIR="$HOME/.config/claude-channels/deploy-events"
+        mkdir -p "$EVENTS_DIR"
+        REPO_FILE="${GITHUB_REPOSITORY//\//-}"
+        
+        FAILED_STEP=""
+        # Add step failure detection here based on project's deploy steps
+        
+        if command -v jq >/dev/null 2>&1; then
+          jq -n \
+            --arg event "deploy-complete" \
+            --arg status "${{ job.status }}" \
+            --arg failedStep "$FAILED_STEP" \
+            --arg repository "${{ github.repository }}" \
+            --arg commit "${GITHUB_SHA:0:7}" \
+            --arg runUrl "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --arg environment "production" \
+            --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{event: $event, status: $status, failedStep: $failedStep, repository: $repository, commit: $commit, runUrl: $runUrl, environment: $environment, timestamp: $timestamp}' \
+            > "$EVENTS_DIR/${REPO_FILE}.json"
+        fi
+        
+        # Wake ALL Claude Code sessions for this repo via FIFO
+        WAKE_SCRIPT="$HOME/.claude/hooks/wake-claude.sh"
+        if [ -x "$WAKE_SCRIPT" ]; then
+          "$WAKE_SCRIPT" "${GITHUB_REPOSITORY}" || true
+        fi
 ```
 
 **Add verify job** after deploy:
@@ -89,6 +114,34 @@ Read the existing `.github/workflows/ci.yml` (or equivalent) and add:
         with:
           url: <PRODUCTION_URL>  # Replace with actual URL
           checks: health,homepage
+          repository: ${{ github.repository }}
+          send-notification: 'false'
+      - name: Write verify event for Claude Code
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          EVENTS_DIR="$HOME/.config/claude-channels/deploy-events"
+          mkdir -p "$EVENTS_DIR"
+          REPO_FILE="${GITHUB_REPOSITORY//\//-}"
+          
+          if command -v jq >/dev/null 2>&1; then
+            jq -n \
+              --arg event "verify-complete" \
+              --arg status "${{ job.status }}" \
+              --arg repository "${{ github.repository }}" \
+              --arg commit "${GITHUB_SHA:0:7}" \
+              --arg environment "production" \
+              --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              '{event: $event, status: $status, repository: $repository, commit: $commit, environment: $environment, timestamp: $timestamp}' \
+              > "$EVENTS_DIR/${REPO_FILE}-verify.json"
+          fi
+          
+          # Wake ALL Claude Code sessions for this repo via FIFO
+          WAKE_SCRIPT="$HOME/.claude/hooks/wake-claude.sh"
+          if [ -x "$WAKE_SCRIPT" ]; then
+            "$WAKE_SCRIPT" "${GITHUB_REPOSITORY}" || true
+          fi
 ```
 
 **Important:** Identify the production URL from the project's CLAUDE.md, README, or configuration.
@@ -98,7 +151,7 @@ Read the existing `.github/workflows/ci.yml` (or equivalent) and add:
 ```bash
 # Create symlink to ci-workflow-monitor skill
 mkdir -p .claude/skills
-ln -sf ~/GitHub/Olbrasoft/GitHub.Actions.Notify/skills/ci-workflow-monitor .claude/skills/ci-workflow-monitor
+ln -sf ~/Olbrasoft/GitHub.Actions.Notify/skills/ci-workflow-monitor .claude/skills/ci-workflow-monitor
 echo "Skill linked: ci-workflow-monitor"
 ```
 
@@ -107,13 +160,16 @@ echo "Skill linked: ci-workflow-monitor"
 Add the following section to the project's CLAUDE.md:
 
 ```markdown
-## CI/CD Feedback
+## CI/CD Feedback (FIFO-Based Push Wake)
 
-This project uses [GitHub.Actions.Notify](https://github.com/Olbrasoft/GitHub.Actions.Notify) for CI/CD feedback.
+This project uses FIFO-based push wake for CI/CD notifications.
 
-- **Deploy + Verify** jobs run on self-hosted runner with TTS notifications
-- **CronCreate monitoring:** After creating a PR, use the `ci-workflow-monitor` skill
+- **Deploy + Verify** jobs run on self-hosted runner, write event files + call `wake-claude.sh`
+- **Code review** events arrive via `gh webhook forward` + `webhook-receiver.py`
+- **Push notifications** wake Claude Code instantly via FIFO pipes — no polling
 - **Production URL:** <URL>
+
+See `ci-workflow-monitor` skill for event handling details.
 ```
 
 ### Step 6: Verify Setup
@@ -136,11 +192,12 @@ ls -la .claude/skills/ci-workflow-monitor
 
 After running this skill, verify:
 - [ ] Self-hosted runner is registered and online
-- [ ] CI workflow has `deploy-status` notification step
-- [ ] CI workflow has `verify` job with Playwright
+- [ ] CI workflow has deploy event file write + `wake-claude.sh` call
+- [ ] CI workflow has `verify` job with Playwright + verify event write + `wake-claude.sh` call
 - [ ] `ci-workflow-monitor` skill is linked in `.claude/skills/`
 - [ ] CLAUDE.md updated with CI/CD feedback section
-- [ ] Test notification received via TTS
+- [ ] `wake-on-event.sh` and `wake-claude.sh` are in `~/.claude/hooks/` and executable
+- [ ] `gh-webhook-forward.service` is running (for code review notifications)
 
 ## Project-Specific Adaptations
 
