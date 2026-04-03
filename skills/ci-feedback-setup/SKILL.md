@@ -1,71 +1,105 @@
 ---
 name: ci-feedback-setup
-description: Set up CI/CD feedback infrastructure for any Olbrasoft project. Registers self-hosted runner, modifies CI workflow, links monitoring skill. Use when starting work on a project that needs CI notifications and post-deploy verification.
+description: Set up FIFO-based push wake CI/CD feedback for any Olbrasoft project. Adds deploy/verify event notifications, code review webhooks, and autonomous pipeline monitoring. Use when user says "nastav FIFO wake", "nastav CI feedback", or when starting work on a project that needs CI notifications.
 ---
 
-# CI Feedback Setup
+# CI Feedback Setup — FIFO-Based Push Wake
 
-One-time setup skill that integrates CI/CD feedback into the current project. After running this skill, the project will have:
-- TTS notifications from GitHub Actions (build, deploy, verify results)
-- FIFO-based push wake notifications via `ci-workflow-monitor` skill
-- Post-deploy Playwright production verification
+One-time setup skill that integrates FIFO-based push wake CI/CD feedback into the current project. After running this skill, the project will have:
+- **FIFO push wake** — Claude Code wakes instantly when deploy completes or Copilot reviews a PR
+- **Deploy failure detection** — `failedStep` field identifies which step failed
+- **Post-deploy Playwright verification** — automated production verification
+- **TTS notifications** — user hears results via VirtualAssistant voice output
 
-## Prerequisites
+## How It Works
 
-Before running this skill, ensure:
-1. **VirtualAssistant** is running on `localhost:5055` with `ci-pipeline` agent type
-2. **gh CLI** is authenticated (`gh auth status`)
-3. **GitHub.Actions.Notify** repo is cloned at `~/GitHub/Olbrasoft/GitHub.Actions.Notify/`
+```
+Deploy completes → GitHub Actions writes event file + calls wake-claude.sh → FIFO wakes Claude Code
+Copilot reviews PR → gh webhook forward → webhook-receiver.py → FIFO wakes correct session (by branch)
+```
 
-## Setup Steps
+Each Claude Code session creates a FIFO pipe at `/tmp/claude-wake/{REPO}/{PID}.fifo`. External processes write event data through the FIFO to wake the session. Zero CPU while waiting.
+
+## Prerequisites (Global — Already Installed)
+
+These are already set up globally. **Do NOT reinstall.** Just verify they exist:
+
+```bash
+# Verify global hooks exist and are executable
+ls -la ~/.claude/hooks/wake-on-event.sh    # FIFO-based asyncRewake hook
+ls -la ~/.claude/hooks/wake-claude.sh       # Wake script (finds matching FIFOs)
+ls -la ~/.claude/hooks/webhook-receiver.py  # Webhook receiver (port 9877)
+ls -la ~/.claude/hooks/check-deploy-status.sh  # Fallback reader
+
+# Verify hooks are configured in settings.json
+grep -c "wake-on-event.sh" ~/.claude/settings.json  # Should be 2 (SessionStart + Stop)
+
+# Verify webhook forward service is running
+systemctl --user status gh-webhook-forward.service
+```
+
+If any of these are missing, something is wrong with the global setup. Do NOT proceed — investigate first.
+
+## Setup Steps (Per-Project)
 
 ### Step 1: Identify Project
 
-Determine the current project:
 ```bash
-# Get repo info
 REPO=$(gh repo view --json nameWithOwner --jq '.nameWithOwner' 2>/dev/null)
 REPO_SHORT=$(basename "$PWD")
-echo "Setting up CI feedback for: $REPO"
+echo "Setting up FIFO wake CI feedback for: $REPO"
 ```
 
-### Step 2: Check Existing Runner
+### Step 2: Add Repo to Webhook Forwards (Code Review Notifications)
+
+Check if the repo is already in `~/.claude/hooks/start-webhook-forwards.sh`:
 
 ```bash
-# Check if self-hosted runner exists
+grep "$REPO" ~/.claude/hooks/start-webhook-forwards.sh
+```
+
+If NOT found, add it to the `REPOS` array:
+
+```bash
+# Edit ~/.claude/hooks/start-webhook-forwards.sh
+# Add the repo to the REPOS array, e.g.:
+#   "Olbrasoft/NewProject"
+
+# Then restart the service to pick up the change:
+systemctl --user restart gh-webhook-forward.service
+```
+
+**Why:** `gh webhook forward` receives Copilot code review events via WebSocket. Without this, code review FIFO wake won't work for this repo. Deploy FIFO wake works regardless (it runs on the self-hosted runner).
+
+### Step 3: Ensure Self-Hosted Runner Exists
+
+```bash
 gh api "repos/${REPO}/actions/runners" --jq '.runners[] | "\(.name) \(.status)"'
 ```
 
 If no runner exists, register one:
+
 ```bash
-# Create runner directory
 RUNNER_DIR="$HOME/actions-runner-${REPO_SHORT}"
 mkdir -p "$RUNNER_DIR" && cd "$RUNNER_DIR"
 
-# Download runner
 RUNNER_VERSION=$(curl -s https://api.github.com/repos/actions/runner/releases/latest | jq -r '.tag_name' | sed 's/^v//')
 curl -sL "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz" | tar xz
 
-# Get token and configure
 TOKEN=$(gh api "repos/${REPO}/actions/runners/registration-token" -X POST --jq '.token')
 ./config.sh --url "https://github.com/${REPO}" --token "$TOKEN" --name "$(hostname)-${REPO_SHORT}" --work "_work" --unattended
 
-# Install as systemd service
 sudo ./svc.sh install "$(whoami)"
 sudo systemctl start "actions.runner.${REPO/\//-}.$(hostname)-${REPO_SHORT}.service"
 ```
 
-### Step 3: Modify CI Workflow
+### Step 4: Add Deploy Event + FIFO Wake to CI Workflow
 
-Read the existing `.github/workflows/ci.yml` (or equivalent) and add:
+Read the existing `.github/workflows/ci.yml` (or deploy workflow). The deploy job MUST run on `self-hosted`.
 
-**For the deploy job** (change `runs-on` to `self-hosted`):
+**Add at the end of the deploy job** (after all deploy steps):
+
 ```yaml
-  deploy:
-    runs-on: self-hosted  # Changed from ubuntu-latest
-    # ... existing steps ...
-
-    # ADD: Write deploy event file + wake Claude Code via FIFO
     - name: Write deploy event for Claude Code
       if: always()
       continue-on-error: true
@@ -74,10 +108,14 @@ Read the existing `.github/workflows/ci.yml` (or equivalent) and add:
         EVENTS_DIR="$HOME/.config/claude-channels/deploy-events"
         mkdir -p "$EVENTS_DIR"
         REPO_FILE="${GITHUB_REPOSITORY//\//-}"
-        
+
+        # Detect which step failed — customize these step IDs for this project!
         FAILED_STEP=""
-        # Add step failure detection here based on project's deploy steps
-        
+        # if [ "${{ steps.build.outcome }}" = "failure" ]; then FAILED_STEP="build"; fi
+        # if [ "${{ steps.test.outcome }}" = "failure" ]; then FAILED_STEP="test"; fi
+        # if [ "${{ steps.deploy.outcome }}" = "failure" ]; then FAILED_STEP="deploy"; fi
+        # if [ "${{ steps.health.outcome }}" = "failure" ]; then FAILED_STEP="health"; fi
+
         if command -v jq >/dev/null 2>&1; then
           jq -n \
             --arg event "deploy-complete" \
@@ -85,21 +123,29 @@ Read the existing `.github/workflows/ci.yml` (or equivalent) and add:
             --arg failedStep "$FAILED_STEP" \
             --arg repository "${{ github.repository }}" \
             --arg commit "${GITHUB_SHA:0:7}" \
+            --arg commitMessage "$(git log -1 --pretty=%s 2>/dev/null || echo unknown)" \
             --arg runUrl "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
             --arg environment "production" \
             --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            '{event: $event, status: $status, failedStep: $failedStep, repository: $repository, commit: $commit, runUrl: $runUrl, environment: $environment, timestamp: $timestamp}' \
+            '{event: $event, status: $status, failedStep: $failedStep, repository: $repository, commit: $commit, commitMessage: $commitMessage, runUrl: $runUrl, environment: $environment, timestamp: $timestamp}' \
             > "$EVENTS_DIR/${REPO_FILE}.json"
-        fi
-        
-        # Wake ALL Claude Code sessions for this repo via FIFO
-        WAKE_SCRIPT="$HOME/.claude/hooks/wake-claude.sh"
-        if [ -x "$WAKE_SCRIPT" ]; then
-          "$WAKE_SCRIPT" "${GITHUB_REPOSITORY}" || true
+
+          # Wake ALL Claude Code sessions for this repo via FIFO
+          WAKE_SCRIPT="$HOME/.claude/hooks/wake-claude.sh"
+          if [ -x "$WAKE_SCRIPT" ]; then
+            "$WAKE_SCRIPT" "${GITHUB_REPOSITORY}" || true
+          else
+            echo "Claude wake script not found: $WAKE_SCRIPT" >&2
+          fi
+        else
+          echo "jq not installed; skipping deploy event write." >&2
         fi
 ```
 
-**Add verify job** after deploy:
+**IMPORTANT:** Customize the `FAILED_STEP` detection — uncomment and adjust the step IDs to match this project's actual deploy steps. Look at existing step `id:` fields in the workflow.
+
+### Step 5: Add Verify Job (After Deploy)
+
 ```yaml
   verify:
     name: Verify production
@@ -109,6 +155,7 @@ Read the existing `.github/workflows/ci.yml` (or equivalent) and add:
     steps:
       - name: Wait for deployment propagation
         run: sleep 10
+
       - name: Verify production
         uses: Olbrasoft/GitHub.Actions.Notify/actions/playwright-verify@v1
         with:
@@ -116,6 +163,7 @@ Read the existing `.github/workflows/ci.yml` (or equivalent) and add:
           checks: health,homepage
           repository: ${{ github.repository }}
           send-notification: 'false'
+
       - name: Write verify event for Claude Code
         if: always()
         continue-on-error: true
@@ -124,7 +172,7 @@ Read the existing `.github/workflows/ci.yml` (or equivalent) and add:
           EVENTS_DIR="$HOME/.config/claude-channels/deploy-events"
           mkdir -p "$EVENTS_DIR"
           REPO_FILE="${GITHUB_REPOSITORY//\//-}"
-          
+
           if command -v jq >/dev/null 2>&1; then
             jq -n \
               --arg event "verify-complete" \
@@ -135,29 +183,31 @@ Read the existing `.github/workflows/ci.yml` (or equivalent) and add:
               --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
               '{event: $event, status: $status, repository: $repository, commit: $commit, environment: $environment, timestamp: $timestamp}' \
               > "$EVENTS_DIR/${REPO_FILE}-verify.json"
-          fi
-          
-          # Wake ALL Claude Code sessions for this repo via FIFO
-          WAKE_SCRIPT="$HOME/.claude/hooks/wake-claude.sh"
-          if [ -x "$WAKE_SCRIPT" ]; then
-            "$WAKE_SCRIPT" "${GITHUB_REPOSITORY}" || true
+
+            WAKE_SCRIPT="$HOME/.claude/hooks/wake-claude.sh"
+            if [ -x "$WAKE_SCRIPT" ]; then
+              "$WAKE_SCRIPT" "${GITHUB_REPOSITORY}" || true
+            else
+              echo "Claude wake script not found: $WAKE_SCRIPT" >&2
+            fi
+          else
+            echo "jq not installed; skipping verify event write." >&2
           fi
 ```
 
-**Important:** Identify the production URL from the project's CLAUDE.md, README, or configuration.
+**Replace `<PRODUCTION_URL>`** with the actual production URL from the project's CLAUDE.md or README.
 
-### Step 4: Link Monitoring Skill
+### Step 6: Link Monitoring Skill
 
 ```bash
-# Create symlink to ci-workflow-monitor skill
 mkdir -p .claude/skills
 ln -sf ~/Olbrasoft/GitHub.Actions.Notify/skills/ci-workflow-monitor .claude/skills/ci-workflow-monitor
 echo "Skill linked: ci-workflow-monitor"
 ```
 
-### Step 5: Update CLAUDE.md
+### Step 7: Update Project CLAUDE.md
 
-Add the following section to the project's CLAUDE.md:
+Add to the project's CLAUDE.md:
 
 ```markdown
 ## CI/CD Feedback (FIFO-Based Push Wake)
@@ -172,42 +222,53 @@ This project uses FIFO-based push wake for CI/CD notifications.
 See `ci-workflow-monitor` skill for event handling details.
 ```
 
-### Step 6: Verify Setup
+### Step 8: Verify Setup
 
 ```bash
-# Test notification endpoint
+# 1. Verify runner is online
+gh api "repos/${REPO}/actions/runners" --jq '.runners[] | "\(.name): \(.status)"'
+
+# 2. Verify skill is linked
+ls -la .claude/skills/ci-workflow-monitor/SKILL.md
+
+# 3. Verify repo is in webhook forwards
+grep "$REPO" ~/.claude/hooks/start-webhook-forwards.sh
+
+# 4. Verify webhook forward service is running
+systemctl --user status gh-webhook-forward.service --no-pager | head -3
+
+# 5. Verify FIFO hooks are executable
+ls -x ~/.claude/hooks/wake-on-event.sh ~/.claude/hooks/wake-claude.sh
+
+# 6. Test TTS notification endpoint (optional)
 curl -s -X POST "http://localhost:5055/api/notifications" \
   -H "Content-Type: application/json" \
   -d '{"text":"CI feedback setup test pro '"${REPO_SHORT}"'","source":"ci-pipeline"}' \
   | jq .
-
-# Verify runner is online
-gh api "repos/${REPO}/actions/runners" --jq '.runners[] | "\(.name): \(.status)"'
-
-# Verify skill is linked
-ls -la .claude/skills/ci-workflow-monitor
 ```
 
 ## Post-Setup Checklist
 
-After running this skill, verify:
-- [ ] Self-hosted runner is registered and online
-- [ ] CI workflow has deploy event file write + `wake-claude.sh` call
-- [ ] CI workflow has `verify` job with Playwright + verify event write + `wake-claude.sh` call
-- [ ] `ci-workflow-monitor` skill is linked in `.claude/skills/`
+- [ ] Self-hosted runner registered and online
+- [ ] Repo added to `~/.claude/hooks/start-webhook-forwards.sh`
+- [ ] `gh-webhook-forward.service` restarted (if repo was added)
+- [ ] CI workflow: deploy event write + `wake-claude.sh` call added
+- [ ] CI workflow: verify job with Playwright + verify event write added
+- [ ] `failedStep` detection customized for project's deploy steps
+- [ ] `ci-workflow-monitor` skill linked in `.claude/skills/`
 - [ ] CLAUDE.md updated with CI/CD feedback section
-- [ ] `wake-on-event.sh` and `wake-claude.sh` are in `~/.claude/hooks/` and executable
-- [ ] `gh-webhook-forward.service` is running (for code review notifications)
+- [ ] Production URL set correctly in verify job
 
 ## Project-Specific Adaptations
 
 ### Rust Projects (like cr)
 - Keep build/test on `ubuntu-latest` (Rust compilation is CPU-heavy)
 - Only deploy + verify on `self-hosted`
+- failedStep IDs: `validate`, `sync`, `build-restart`, `health-check`
 
-### .NET Projects
+### .NET Projects (like VirtualAssistant)
 - Can run entire pipeline on `self-hosted` (fast builds)
-- Or keep cloud runners for build/test
+- failedStep IDs: `restore`, `build`, `test`, `publish`, `copy-assets`, `restart`, `health`
 
 ### Node.js / Frontend Projects
 - Consider adding Playwright browser tests in verify job
@@ -217,7 +278,12 @@ After running this skill, verify:
 
 | Issue | Solution |
 |-------|----------|
+| Code review FIFO wake not working | Check repo is in `start-webhook-forwards.sh` and service restarted |
+| Deploy FIFO wake not working | Check `wake-claude.sh` call is in CI workflow, inside `jq` block |
 | Runner not connecting | `sudo systemctl restart actions.runner.*.service` |
-| Notification 400 error | Check VirtualAssistant has `ci-pipeline` agent type (ID 30) |
-| Playwright not found | `npx playwright install chromium` |
+| FIFO registration not created | Session must be started from project directory (not `~`) |
+| Event file not written | Check `jq` is installed on runner: `command -v jq` |
+| Multiple sessions, only one gets event | Verify `wake-claude.sh` sends data THROUGH FIFO (not just "wake") |
+| TTS notification 400 error | Check VirtualAssistant has `ci-pipeline` agent type (ID 30) |
+| Playwright not found | `npx playwright install chromium` (local PC only, never server) |
 | Deploy job can't reach VPS | Verify SSH secrets are set in repo settings |
