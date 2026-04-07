@@ -66,41 +66,14 @@ fi
 FIFO="$WAKE_DIR/.session-${CLAUDE_PID}.fifo"
 MANIFEST="$WAKE_DIR/.session-${CLAUDE_PID}.json"
 
-###############################################################################
-# Singleton check
-###############################################################################
-
-# Refuse to run if another wake-on-event.sh instance is already reading the
-# same FIFO. Multiple readers cause the kernel to deliver each FIFO write to
-# only ONE of them — events get stolen by competing readers.
-#
-# We detect existing readers by looking for `cat $FIFO` processes whose
-# parent is a wake-on-event.sh whose grandparent is OUR Claude PID. If we
-# find one, exit silently.
-my_pid=$$
-existing_reader=0
-for cat_pid in $(pgrep -f "cat $FIFO" 2>/dev/null); do
-    # Skip if it's our future child (we haven't spawned it yet)
-    cat_ppid=$(awk '{print $4}' "/proc/$cat_pid/stat" 2>/dev/null) || continue
-    [ "$cat_ppid" = "$my_pid" ] && continue
-    # Check if this cat's chain goes up to our CLAUDE_PID
-    chain_pid="$cat_ppid"
-    chain_depth=0
-    while [ "$chain_pid" -gt 1 ] && [ "$chain_depth" -lt 8 ]; do
-        if [ "$chain_pid" = "$CLAUDE_PID" ]; then
-            existing_reader=1
-            break
-        fi
-        chain_pid=$(awk '{print $4}' "/proc/$chain_pid/stat" 2>/dev/null) || break
-        chain_depth=$((chain_depth + 1))
-    done
-    [ "$existing_reader" = "1" ] && break
-done
-
-if [ "$existing_reader" = "1" ]; then
-    # Another legitimate reader for our session is already running. Exit silently.
-    exit 0
-fi
+# NOTE: there is no singleton check. Multiple wake-on-event.sh instances per
+# session are intentional: Claude Code spawns a new hook on every Stop event,
+# and old instances stay blocked on `cat $FIFO` until either (a) they receive
+# an event and exit 2, or (b) their 600s timeout expires. Multiple readers
+# blocked on the same FIFO are a feature — when wake-claude.sh writes one
+# event, the kernel atomically delivers it to exactly one reader; the others
+# stay alive and act as backup readers for subsequent events. This makes the
+# wake mechanism more resilient to bursts.
 
 ###############################################################################
 # Cleanup on real exit (not on exit 2 — Claude Code respawns the hook then)

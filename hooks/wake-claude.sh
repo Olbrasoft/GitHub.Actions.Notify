@@ -16,18 +16,21 @@
 #
 #   1. Read all events from $EVENTS_DIR matching this repo prefix
 #   2. For each event:
-#      a. Try to extract a target Claude PID from the PR body marker
-#         <!-- claude-pid: NNN --> using gh api (if PR number is derivable).
-#         If marker points to a live Claude process → use it.
-#      b. Otherwise (marker missing or stale), enumerate ALL live Claude
-#         processes via pgrep -x claude and find ones whose /proc/PID/cwd
-#         matches the repo basename. STRICT MATCHING:
+#      a. PRIMARY routing — extract claude-session UUID marker from PR body
+#         (<!-- claude-session: UUID -->) via gh pr view. The UUID is the
+#         basename of the JSONL file in ~/.claude/projects/<encoded-cwd>/.
+#         Find the live Claude PID whose CURRENT session (most recently
+#         modified JSONL in its cwd's project dir) matches this UUID.
+#         If found → that's the target.
+#      b. FALLBACK routing — if no marker, or marker session not running,
+#         enumerate ALL live Claude processes via pgrep -x claude and find
+#         ones whose /proc/PID/cwd basename matches the repo. STRICT:
 #           - exactly 1 match → use it
 #           - 0 matches OR 2+ matches → DROP (ambiguous, refuse to guess)
 #      c. If no live target found → DROP event, exit 0
 #      d. Find the target session's FIFO at /tmp/claude-wake/.session-<PID>.fifo
 #      e. Kill any orphan readers on that FIFO (PPID = systemd-user)
-#      f. Write the event JSON to the FIFO with bounded retry (up to 60s,
+#      f. Write the event JSON to the FIFO with bounded retry (up to 300s,
 #         polling every 1s, re-checking liveness between attempts)
 #      g. On success → delete event file. On timeout → drop event.
 #
@@ -53,7 +56,8 @@ fi
 
 EVENTS_DIR="$HOME/.config/claude-channels/deploy-events"
 WAKE_DIR="/tmp/claude-wake"
-WRITE_RETRY_SECS="${WAKE_CLAUDE_RETRY_SECS:-60}"
+PROJECTS_DIR="$HOME/.claude/projects"
+WRITE_RETRY_SECS="${WAKE_CLAUDE_RETRY_SECS:-300}"
 WRITE_TIMEOUT="${WAKE_CLAUDE_WRITE_TIMEOUT:-3}"
 
 [ -d "$EVENTS_DIR" ] || exit 0
@@ -86,10 +90,10 @@ find_claude_pids_for_repo() {
     done
 }
 
-# Try to extract a Claude target PID from a PR body marker.
-# Marker format: <!-- claude-pid: NNN -->
+# Extract the claude-session UUID from a PR body marker.
+# Marker format: <!-- claude-session: UUID -->
 # Returns empty string if no marker found or gh api fails.
-pid_from_pr_body() {
+session_uuid_from_pr_body() {
     local pr_num="$1"
     [ -z "$pr_num" ] && return 0
 
@@ -97,9 +101,38 @@ pid_from_pr_body() {
     body=$(timeout 10 gh pr view "$pr_num" --repo "$REPO_FULL" --json body --jq '.body' 2>/dev/null)
     [ -z "$body" ] && return 0
 
-    if [[ "$body" =~ claude-pid:[[:space:]]*([0-9]+) ]]; then
+    if [[ "$body" =~ claude-session:[[:space:]]*([a-f0-9-]+) ]]; then
         echo "${BASH_REMATCH[1]}"
     fi
+}
+
+# Find the live Claude PID whose CURRENT session is the given UUID. The
+# current session is the most-recently-modified .jsonl file in the project
+# directory keyed by the Claude process's cwd.
+#
+# Returns empty string if no live Claude has the given session as current.
+pid_for_session_uuid() {
+    local uuid="$1"
+    [ -z "$uuid" ] && return 0
+
+    for pid in $(pgrep -x claude 2>/dev/null); do
+        local cwd
+        cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null) || continue
+        local enc proj_dir
+        enc=$(echo "$cwd" | sed 's|/|-|g')
+        proj_dir="$PROJECTS_DIR/$enc"
+        [ -d "$proj_dir" ] || continue
+
+        # Most-recently-modified JSONL is the active session for this PID.
+        local latest
+        latest=$(ls -t "$proj_dir"/*.jsonl 2>/dev/null | head -1)
+        [ -z "$latest" ] && continue
+        local basename="${latest##*/}"
+        if [ "${basename%.jsonl}" = "$uuid" ]; then
+            echo "$pid"
+            return 0
+        fi
+    done
 }
 
 # Verify a PID is a live Claude process. Returns 0 if alive Claude, 1 otherwise.
@@ -219,13 +252,17 @@ process_event_file() {
         fi
     fi
 
-    # Find target PID — primary: PR body marker, fallback: cwd matching
+    # Find target PID — PRIMARY: session UUID from PR body marker
+    #                  FALLBACK: strict cwd matching (exactly one Claude on repo)
     local target_pid=""
+    local session_uuid=""
     if [ -n "$pr_num" ]; then
-        target_pid=$(pid_from_pr_body "$pr_num")
-        if [ -n "$target_pid" ] && ! is_live_claude "$target_pid"; then
-            log "PR body marker PID $target_pid is not a live Claude — falling back to cwd matching"
-            target_pid=""
+        session_uuid=$(session_uuid_from_pr_body "$pr_num")
+        if [ -n "$session_uuid" ]; then
+            target_pid=$(pid_for_session_uuid "$session_uuid")
+            if [ -z "$target_pid" ]; then
+                log "Session UUID $session_uuid (from PR #$pr_num body) has no live Claude — falling back to cwd matching"
+            fi
         fi
     fi
 

@@ -108,17 +108,28 @@ Wake happens within seconds of the GitHub event, while the session is still aliv
 2. Extract PR number (from prNumber field, OR derive via gh api commits/$sha/pulls)
 3. PRIMARY routing: if PR number is known, fetch PR body via
        gh pr view N --repo $REPO_FULL --json body
-   and look for marker:
-       <!-- claude-pid: NNN -->
-   If marker points to a live `claude` process → target_pid = NNN
-4. FALLBACK routing: enumerate `pgrep -x claude` and select PIDs whose
-   /proc/PID/cwd basename equals the repo basename. STRICT:
+   and look for the session UUID marker:
+       <!-- claude-session: UUID -->
+   The UUID is the basename of the JSONL file in
+   ~/.claude/projects/<encoded-cwd>/. Find the live Claude PID whose
+   CURRENT session (most recently modified .jsonl in its cwd's project
+   dir) matches this UUID:
+     for each pid in `pgrep -x claude`:
+         cwd = readlink /proc/$pid/cwd
+         enc = cwd with / replaced by -
+         latest = most recently modified .jsonl in $HOME/.claude/projects/$enc/
+         if basename(latest) == "$UUID.jsonl":
+             target_pid = pid
+             break
+4. FALLBACK routing: if no marker, or marker session not running, enumerate
+   `pgrep -x claude` and select PIDs whose /proc/PID/cwd basename equals
+   the repo basename. STRICT:
      - exactly 1 match → target_pid = that one
      - 0 matches OR 2+ matches → DROP (ambiguous, refuse to guess)
 5. If target_pid is not a live Claude → DROP
 6. Find FIFO at /tmp/claude-wake/.session-{target_pid}.fifo
 7. Kill any orphan readers on that FIFO (PPID = systemd-user)
-8. Bounded retry write loop (default 60s, configurable via
+8. Bounded retry write loop (default 300s, configurable via
    WAKE_CLAUDE_RETRY_SECS):
      for each iteration:
        re-check target liveness
@@ -128,6 +139,34 @@ Wake happens within seconds of the GitHub event, while the session is still aliv
      if loop expires → DROP
 9. Always delete the event file at the end (delivered or dropped)
 ```
+
+## How the session UUID gets into PR bodies
+
+Claude Code sessions are identified by the JSONL filename in
+`~/.claude/projects/<encoded-cwd>/`. The current session for a running
+Claude process is the most recently modified `.jsonl` in that directory.
+
+When Claude creates a PR, it must embed this UUID at the top of the PR
+body so wake-claude.sh can route events back to it. This is documented
+in the user's CLAUDE.md and in the `dotnet-coding` skill. The model uses
+the helper script `~/.claude/hooks/get-session-id.sh`:
+
+```bash
+SESSION_ID=$(~/.claude/hooks/get-session-id.sh)
+gh pr create --title "feat: X" --body "$(cat <<EOF
+<!-- claude-session: $SESSION_ID -->
+
+Closes #123
+
+## Summary
+…
+EOF
+)"
+```
+
+The helper walks up the parent process tree to find the Claude PID, reads
+its `/proc/PID/cwd`, encodes that to find the project directory, and emits
+the most recently modified `.jsonl` basename.
 
 ## What this design does NOT do (and why)
 

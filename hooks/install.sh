@@ -26,6 +26,7 @@ INSTALL_DIR="$HOME/.claude/hooks"
 HOOKS=(
     wake-on-event.sh
     wake-claude.sh
+    get-session-id.sh
     webhook-receiver.py
     start-webhook-forwards.sh
 )
