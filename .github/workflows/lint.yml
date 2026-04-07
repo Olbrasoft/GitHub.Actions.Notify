@@ -1,0 +1,90 @@
+name: Lint
+
+# Runs on every push to main and every PR. Uses the cloud runner so the
+# repo does not need a self-hosted runner of its own (this repo is the tool
+# that registers self-hosted runners for OTHER projects, so it would be a
+# chicken-and-egg problem to require one here).
+#
+# Lints exercised:
+#   * shellcheck on all hooks/*.sh and scripts/*.sh
+#   * bash -n on the same set as a syntax safety net
+#   * python -m py_compile on hooks/webhook-receiver.py
+#   * actionlint on all .github/workflows/*.yml
+#
+# These checks would have caught several real issues from PR #22's Copilot
+# review (hardcoded paths, JSON-via-string-interpolation, missing input
+# validation), and they run in seconds on a free cloud runner.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -qq -y shellcheck
+
+      - name: Run shellcheck on hooks/
+        run: |
+          set -e
+          # SC1091: don't follow sourced files (the install dir is runtime-only)
+          # SC2034: variables used by external scripts (e.g. PIDS in start-webhook-forwards.sh)
+          shellcheck --severity=warning --exclude=SC1091,SC2034 hooks/*.sh
+
+      - name: Run shellcheck on scripts/
+        run: |
+          set -e
+          shellcheck --severity=warning --exclude=SC1091,SC2034 scripts/*.sh
+
+  bash-syntax:
+    name: bash -n
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: bash -n on every shell script
+        run: |
+          set -e
+          for f in hooks/*.sh scripts/*.sh; do
+            [ -f "$f" ] || continue
+            echo "checking: $f"
+            bash -n "$f"
+          done
+
+  python-syntax:
+    name: python compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: py_compile webhook-receiver.py
+        run: python -m py_compile hooks/webhook-receiver.py
+
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install actionlint
+        run: |
+          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash) latest /usr/local/bin
+          actionlint --version
+
+      - name: Run actionlint on workflows and composite actions
+        run: |
+          actionlint -color

@@ -137,3 +137,7 @@ dist
 # Vite logs files
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+
+# Python bytecode (from local lint runs)
+__pycache__/
+*.py[cod]
