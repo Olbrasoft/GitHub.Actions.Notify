@@ -282,9 +282,15 @@ write_with_retry() {
         fi
         # Try short bounded write. If a reader is on the FIFO, this succeeds
         # immediately; if not, it times out after WRITE_TIMEOUT seconds.
+        #
+        # Each event is terminated by a newline (NDJSON framing) so the
+        # consumer can read one event per `read -r` call. Without this,
+        # two writers landing back-to-back end up concatenated as
+        # `{...}{...}` and the consumer's `cat` returns garbled JSON.
+        # Bug 33.
         if WAKE_DATA="$data" WAKE_FIFO="$fifo" \
             timeout "$WRITE_TIMEOUT" \
-            bash -c 'printf "%s" "$WAKE_DATA" > "$WAKE_FIFO"' 2>/dev/null; then
+            bash -c 'printf "%s\n" "$WAKE_DATA" > "$WAKE_FIFO"' 2>/dev/null; then
             return 0
         fi
         sleep 1
