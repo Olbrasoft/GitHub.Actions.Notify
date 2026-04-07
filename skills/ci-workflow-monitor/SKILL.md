@@ -57,7 +57,7 @@ Issue assigned
               └── Notify result
 ```
 
-**Push notifications arrive automatically** — no CronCreate polling needed:
+**Push notifications arrive automatically** — no polling needed:
 - **Code review:** `gh webhook forward` service → `webhook-receiver.py` → event file + FIFO wake → correct Claude Code session wakes (routed by PR branch)
 - **Deploy:** GitHub Actions writes event file + calls `wake-claude.sh` → ALL Claude Code sessions for the repo wake
 - Claude Code wakes from idle state and reacts immediately
@@ -91,166 +91,15 @@ Parent issue
         └── Close sub-issues + parent issue
 ```
 
-## DEPRECATED: CronCreate Prompt Templates
+## Legacy polling templates removed
 
-**CronCreate polling is NO LONGER USED.** Push notifications via asyncRewake hooks replaced it.
-Code review and deploy events arrive automatically — no polling needed.
-
-The templates below are kept only as historical reference. Do NOT use CronCreate for new work.
-
-### Old CronCreate Prompt Template — Single Issue (DEPRECATED)
-
-```
-AUTONOMOUS issue-driven CI/CD monitor for {OWNER}/{REPO}.
-Working on issue #{ISSUE_NUM}, PR #{PR_NUMBER}, branch {BRANCH}.
-
-Act fully autonomously. NEVER ask the user. Only notify on STATE CHANGES.
-
-## Phase 1: CI + Review (while PR is open)
-
-1. Check PR state:
-   gh pr view {PR_NUMBER} --repo {OWNER}/{REPO} --json state --jq '.state'
-   - "MERGED" → skip to Phase 2
-   - "CLOSED" → notify "PR uzavřen" → CronDelete
-
-2. Check CI:
-   gh pr checks {PR_NUMBER} --repo {OWNER}/{REPO}
-   - pending → "CI running" (once) → stop
-   - fail → read logs: gh run list --repo {OWNER}/{REPO} --branch {BRANCH} --limit 1 --json databaseId --jq '.[0].databaseId'
-     Then: gh run view <ID> --repo {OWNER}/{REPO} --log-failed 2>&1 | tail -50
-     Analyze error. Fix code. Commit and push. Notify: "CI selhalo, opravuji: {error}"
-   - all pass → step 3
-
-3. Check review:
-   gh pr view {PR_NUMBER} --repo {OWNER}/{REPO} --json reviewDecision,reviews
-
-   Branch protection requires CI checks (Check & Clippy, Format, Test).
-   Copilot code review runs as "Agent" check-run — MUST wait for it before merging.
-
-   **NEVER attempt merge before both CI and Copilot review are done.**
-
-   a) Check Copilot review status (deterministicky přes API):
-      HEAD=$(gh pr view {PR_NUMBER} --repo {OWNER}/{REPO} --json headRefOid --jq '.headRefOid')
-      AGENT_STATUS=$(gh api "repos/{OWNER}/{REPO}/commits/${HEAD}/check-runs" --jq '.check_runs[] | select(.name == "Agent") | .status' 2>/dev/null)
-
-      - AGENT_STATUS is empty → Copilot not active/subscribed → skip review, go to step (c)
-      - AGENT_STATUS is "in_progress" or "queued" → say "Waiting for Copilot review" → STOP
-      - AGENT_STATUS is "completed" → go to step (b)
-
-   b) Read and fix Copilot review comments:
-      gh api repos/{OWNER}/{REPO}/pulls/{PR_NUMBER}/comments --jq '.[].body'
-      - Has actionable comments → fix ALL, commit, push. Notify: "Review komentáře opraveny."
-        After push, new CI + review cycle starts → STOP, wait for next tick
-      - No actionable comments → go to step (c)
-
-   c) Merge:
-      gh pr merge {PR_NUMBER} --repo {OWNER}/{REPO} --merge 2>&1
-      - SUCCEEDS → Notify: "PR #{PR_NUMBER} mergnut (issue #{ISSUE_NUM}). Sleduji deploy."
-      - FAILS → report error, STOP
-
-## Phase 2: Deploy + Verify
-
-4. Monitor deploy:
-   gh run list --repo {OWNER}/{REPO} --branch main --limit 1 --json status,conclusion,databaseId
-   - in_progress → "Deploy running" (once) → stop
-   - failure → Notify: "Deploy selhal!" + read logs
-   - success → step 5
-
-5. Basic health check:
-   curl -s -o /dev/null -w "%{{http_code}}" --max-time 10 {PRODUCTION_URL}/health
-   curl -s -o /dev/null -w "%{{http_code}}" --max-time 10 {PRODUCTION_URL}/
-   - not 200 → Notify: "Produkce neodpovídá!"
-   - both 200 → step 6
-
-6. Issue-specific verification (curl + Playwright):
-   Read the issue to understand what changed:
-   gh issue view {ISSUE_NUM} --repo {OWNER}/{REPO} --json title,body
-
-   **Step A — curl checks** (quick, automated):
-   - Verify new URLs return HTTP 200
-   - Verify HTML contains expected src/alt/title attributes (grep)
-   - Verify no old numeric-ID URLs remain in HTML
-
-   **Step B — Playwright interactive end-to-end test** (MANDATORY, final check):
-
-   Playwright runs from our LOCAL PC against production URL. NEVER install Playwright/Chromium on the server.
-
-   Open the production page in Playwright and perform a FULL interactive test — not just a screenshot.
-   The test must simulate what a real user would do:
-
-   **For static pages (displaying data):**
-   - Navigate to URL, wait for content to load
-   - Verify expected elements are visible (images render, text correct, layout OK)
-   - Take screenshot as proof
-
-   **For interactive features (forms, buttons, downloads):**
-   - Navigate to the page
-   - Fill inputs with test data
-   - Click buttons and wait for results
-   - Verify the result is correct (preview appears, data loads, download starts)
-   - Take screenshot at each step
-   - Example: video download page → paste URL → click "Načíst info" → verify preview → click "Stáhnout" → verify download
-
-   **For API features:**
-   - First test API directly via curl (quick sanity check)
-   - Then test the full user flow via Playwright UI
-
-   Based on the issue description, verify specific changes:
-   - New image/flag/coat → screenshot, confirm image visually renders
-   - New page/route → navigate, screenshot, confirm it loads
-   - UI change → screenshot, compare with expected result
-   - Interactive feature → full user flow test (fill, click, verify result)
-   - Bug fix → reproduce original scenario, screenshot, confirm fix
-   - SEO change → check page source + visual appearance
-
-   **MANDATORY: Test ALL UI elements on changed pages:**
-   - Click every button and verify its effect
-   - Toggle every switch and verify both states
-   - Fill every input and verify validation
-   - Check every link (href, target)
-   - Disabled/non-functional controls must NOT be shown
-   - Capture console errors: `page.on('console')` + `page.on('pageerror')` — must be ZERO
-
-   If verification FAILS (broken image, missing content, wrong layout):
-   - Notify: "Verifikace selhala: {what's wrong}. Opravuji."
-   - Fix the issue, create new PR, restart pipeline
-   - Do NOT close the issue
-
-   If verification PASSES (both curl and visual):
-   - Notify: "Issue #{ISSUE_NUM} ověřena na produkci: {what was confirmed}"
-   - Then: "PIPELINE COMPLETE — run CronDelete."
-
-Issue IDs for notifications: {ISSUE_IDS}
-```
-
-### Old CronCreate Prompt Template — Parent Issue (DEPRECATED)
-
-```
-AUTONOMOUS pipeline for parent issue #{PARENT_NUM} on {OWNER}/{REPO}.
-Production URL: {PRODUCTION_URL}.
-
-1. List sub-issues:
-   PARENT_ID=$(gh issue view {PARENT_NUM} --repo {OWNER}/{REPO} --json id --jq '.id')
-   gh api graphql -f query="query {{ node(id: \"$PARENT_ID\") {{ ... on Issue {{ subIssues(first: 50) {{ nodes {{ number title state }} }} }} }} }}" --jq '.data.node.subIssues.nodes[]'
-
-2. Check which sub-issues are still open.
-   For each open sub-issue: check if there's already a PR or branch.
-
-3. Track PRs:
-   gh pr list --repo {OWNER}/{REPO} --state open --json number,title,headRefName
-   Match PRs to sub-issues by branch name or title.
-
-4. For each PR:
-   - Check CI + review status (same as single issue Phase 1)
-   - If ready → merge
-   - Continue to next sub-issue
-
-5. When ALL sub-issues are closed and all PRs merged:
-   - Monitor final deploy
-   - Verify ALL changes on production (per sub-issue)
-   - Notify: "Parent issue #{PARENT_NUM} kompletní. Všechny sub-issues ověřeny."
-   - CronDelete
-```
+Earlier versions of this skill shipped prompt templates that asked Claude
+Code to poll PR/CI/review/deploy state every two minutes via repeated
+`gh pr checks` calls. That polling mechanism has been completely replaced
+by FIFO-based push wake (see the "FIFO-Based Push Wake Notifications"
+section below). The templates were removed in PR #22 to avoid confusing
+future readers; the git history retains them if anyone needs to
+reconstruct the old flow.
 
 ## Key Commands Reference
 
@@ -287,7 +136,7 @@ curl -s -o /dev/null -w "%{http_code}" <URL>/
 
 ## FIFO-Based Push Wake Notifications
 
-Push notifications arrive automatically via FIFO pipes. **No CronCreate polling needed. No inotifywait. No flock.**
+Push notifications arrive automatically via FIFO pipes. **No polling. No inotifywait. No flock.**
 
 ### Architecture
 ```

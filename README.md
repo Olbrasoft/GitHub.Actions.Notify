@@ -17,16 +17,27 @@ The agent either blocks waiting, or the user must manually check and relay statu
 **Two complementary feedback channels:**
 
 1. **TTS Voice Notifications** — GitHub Actions posts to [VirtualAssistant](https://github.com/Olbrasoft/VirtualAssistant) on `localhost:5055`. The user hears "Deploy finished" or "Tests failed" spoken aloud.
-2. **CronCreate Polling** — Claude Code autonomously polls CI/review/deploy status every 2 minutes and reacts: fixes failures, merges PRs, verifies production.
+2. **FIFO Push Wake** — GitHub Actions writes a JSON event file and calls `wake-claude.sh`, which delivers the event through a per-session named pipe (FIFO). Claude Code is woken instantly via the asyncRewake hook and reacts autonomously: fixes failures, addresses review comments, merges PRs, verifies production. Events are durable: if no session is alive at wake time, the event file persists and is picked up on the next user prompt by the fallback hook.
 
 ```
 GitHub Actions (self-hosted runner)
-  ├── Deploy job → POST localhost:5055 → VirtualAssistant → TTS "Deploy OK"
-  └── Verify job → Playwright health check → POST → TTS "Produkce ověřena"
+  ├── Deploy job → write event file → wake-claude.sh → FIFO → Claude Code
+  └── Verify job → Playwright health check → write event file → FIFO → Claude Code
 
-Claude Code (local session)
-  └── CronCreate (every 2 min) → gh pr checks → autonomous merge/fix/verify
+GitHub webhook (Copilot code review)
+  └── gh webhook forward → webhook-receiver.py → write event file → FIFO → Claude Code
+
+Claude Code (per session)
+  └── wake-on-event.sh (asyncRewake hook) blocks on FIFO at zero CPU,
+      drains pending event files on startup, exits 2 on event so the
+      assistant re-prompts with the event details as a system reminder.
+
+Fallback (UserPromptSubmit)
+  └── check-deploy-status.sh drains any leftover event files on next
+      user prompt — last line of defense if FIFO push wake missed.
 ```
+
+The full architecture and the durable-queue + ack semantics are documented in [`docs/architecture.md`](docs/architecture.md). The hook scripts themselves live in [`hooks/`](hooks/) and are installed with `./hooks/install.sh`.
 
 ## Actions
 
@@ -151,12 +162,13 @@ Two skills are included for AI coding agent integration:
 
 ### `ci-workflow-monitor`
 
-Issue-driven autonomous CI/CD pipeline monitor. After creating a PR, sets up CronCreate polling that:
-- Monitors CI status and fixes failures
-- Monitors code review and addresses comments
-- Merges PR when ready (no asking!)
-- Monitors deploy and verifies production
-- Reads issue description and verifies issue-specific changes on production
+Issue-driven autonomous CI/CD pipeline monitor. Drives the assistant's reaction when a push wake event arrives via FIFO:
+- On `ci-complete` events: checks if Copilot review is done, then merges the PR
+- On `code-review-complete` events: reads review comments, fixes issues, pushes
+- On `deploy-complete` events: verifies the deployment, runs issue-specific Playwright checks
+- On `verify-complete` events: closes the issue if production is healthy
+
+No polling — events arrive instantly via FIFO push wake.
 
 ### `ci-feedback-setup`
 
@@ -179,11 +191,13 @@ See [docs/architecture.md](docs/architecture.md) for detailed diagrams and data 
 
 1. **GitHub Actions** runs your CI pipeline (build, test)
 2. **Deploy job** runs on self-hosted runner, deploys your app
-3. **Deploy-status action** POSTs notification to VirtualAssistant on localhost
+3. **Deploy-status action** POSTs notification to VirtualAssistant on localhost (TTS channel)
 4. **VirtualAssistant** saves notification, speaks it via TTS (e.g., "Deploy cr finished successfully")
-5. **Verify job** runs curl checks against production URL
-6. **Playwright-verify action** POSTs verification result to VirtualAssistant
-7. **Claude Code** (if running) detects status changes via CronCreate and acts autonomously
+5. **Deploy job** also writes an event file to `~/.config/claude-channels/deploy-events/` and calls `wake-claude.sh` (FIFO push wake channel)
+6. **wake-claude.sh** delivers the event through the per-session FIFO with synchronous ack (write blocks until consumer reads)
+7. **Claude Code** (if running) is woken instantly via the asyncRewake hook, sees the event in its system reminder, and reacts autonomously per the `ci-workflow-monitor` skill
+8. **Verify job** runs Playwright checks against production URL, writes a verify event file, wakes Claude Code again
+9. If Claude Code is **not** running, the event file persists. The next time the user opens a session and submits a prompt, `check-deploy-status.sh` drains the pending events.
 
 ## Integration Guide
 

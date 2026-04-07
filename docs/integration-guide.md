@@ -12,16 +12,77 @@ Step-by-step guide to integrate GitHub.Actions.Notify into any project.
 ## Step 1: Clone This Repository
 
 ```bash
-cd ~/GitHub/Olbrasoft  # or wherever you keep repos
+cd ~/Olbrasoft  # or wherever you keep repos
 git clone https://github.com/Olbrasoft/GitHub.Actions.Notify.git
 ```
 
-## Step 2: Register Self-Hosted Runner
+## Step 2: Install Hooks (one-time per machine)
+
+The wake hooks (FIFO consumer, wake script, webhook receiver, fallback reader) live in this repo under `hooks/`. Install them into `~/.claude/hooks/` once per developer machine:
+
+```bash
+cd ~/Olbrasoft/GitHub.Actions.Notify
+./hooks/install.sh
+```
+
+Verify the install with:
+
+```bash
+./hooks/install.sh --check    # reports drift between repo and ~/.claude/hooks/
+```
+
+Then register `wake-on-event.sh` as an asyncRewake hook in `~/.claude/settings.json` (the install script prints the snippet you need):
+
+```jsonc
+{
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/USER/.claude/hooks/wake-on-event.sh",
+            "asyncRewake": true
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+For code review push wake (Copilot review notifications), enable the systemd user service that runs `gh webhook forward` + `webhook-receiver.py`:
+
+```bash
+# Edit hooks/start-webhook-forwards.sh to include your repos in the REPOS array
+# Then install the systemd unit (one-time):
+mkdir -p ~/.config/systemd/user
+cat > ~/.config/systemd/user/gh-webhook-forward.service <<EOF
+[Unit]
+Description=GitHub Webhook Forward - code review notifications for all Olbrasoft repos
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/home/%u/.claude/hooks/start-webhook-forwards.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+EOF
+
+systemctl --user daemon-reload
+systemctl --user enable --now gh-webhook-forward.service
+```
+
+## Step 3: Register Self-Hosted Runner (per project)
 
 Run the setup script (one-time per repository):
 
 ```bash
-cd ~/GitHub/Olbrasoft/GitHub.Actions.Notify
+cd ~/Olbrasoft/GitHub.Actions.Notify
 ./scripts/setup-runner.sh Olbrasoft/<your-repo>
 ```
 
@@ -40,7 +101,7 @@ sudo systemctl status actions.runner.Olbrasoft-<repo>.$(hostname)-<repo>.service
 gh api repos/Olbrasoft/<your-repo>/actions/runners --jq '.runners[] | "\(.name): \(.status)"'
 ```
 
-## Step 3: Add Notification Steps to CI Workflow
+## Step 4: Add Notification Steps to CI Workflow
 
 Edit your `.github/workflows/ci.yml` (or equivalent). The key change: **deploy and verify jobs must run on `self-hosted`** to access VirtualAssistant on localhost.
 
@@ -118,7 +179,7 @@ To get TTS notifications for each CI stage (build, test, etc.), add to each job.
           repository: ${{ github.repository }}
 ```
 
-## Step 4: Hybrid Runner Strategy
+## Step 5: Hybrid Runner Strategy
 
 For projects with expensive CI (e.g., Rust compilation), use a **hybrid approach** — cloud runners for build/test, self-hosted only for deploy/verify:
 
@@ -130,46 +191,43 @@ For projects with expensive CI (e.g., Rust compilation), use a **hybrid approach
 
 For lightweight projects (.NET, Node.js), you can run everything on `self-hosted`.
 
-## Step 5: Add Claude Code Skill (Recommended)
+## Step 6: Add Claude Code Skill (Recommended)
 
 Link the CI workflow monitor skill to your project:
 
 ```bash
 cd ~/your-project
 mkdir -p .claude/skills
-ln -sf ~/GitHub/Olbrasoft/GitHub.Actions.Notify/skills/ci-workflow-monitor .claude/skills/ci-workflow-monitor
+ln -sf ~/Olbrasoft/GitHub.Actions.Notify/skills/ci-workflow-monitor .claude/skills/ci-workflow-monitor
 ```
 
-This skill contains the CronCreate prompt template that Claude Code uses to autonomously monitor the entire CI/CD pipeline after creating a PR.
+This skill drives the autonomous CI/CD pipeline reaction in Claude Code. It tells the assistant how to react when a deploy event, code review event, CI event, or verify event arrives via FIFO push wake.
 
-## Step 6: Update Project CLAUDE.md (Recommended)
+## Step 7: Update Project CLAUDE.md (Recommended)
 
 Add the following to your project's CLAUDE.md in the Development Workflow section:
 
 ```markdown
-### CI/CD Feedback (Autonomous)
+### CI/CD Feedback (FIFO push wake)
 
-After creating a PR, ALWAYS set up CronCreate monitoring — this is mandatory.
+This project uses FIFO-based push wake for CI/CD notifications. When a deploy
+or verify event arrives, Claude Code is instantly woken via a FIFO pipe and
+reacts according to the `ci-workflow-monitor` skill — no polling.
 
-Use the template from `ci-workflow-monitor` skill:
-- CronCreate polls every 2 minutes
-- Autonomously: fixes CI failures, addresses review comments, merges PRs
-- After merge: monitors deploy, verifies production
-- Reads issue description and verifies issue-specific changes on production
-- NEVER asks the user — acts fully autonomously
-
-Deploy and verify jobs run on self-hosted runner with TTS notifications via VirtualAssistant.
-Production URL: https://your-production-url.com
+- Deploy and verify jobs run on self-hosted runner
+- Code review events arrive via `gh webhook forward` + `webhook-receiver.py`
+- Push notifications wake Claude Code instantly via FIFO pipes
+- Production URL: https://your-production-url.com
 ```
 
-## Step 7: Test the Integration
+## Step 8: Test the Integration
 
 1. Create a test branch with a small change
 2. Push and create a PR
 3. Watch GitHub Actions — CI should run on cloud, deploy on self-hosted
-4. After deploy, you should hear the TTS notification
+4. After deploy, you should hear the TTS notification AND Claude Code (if running) should be woken via FIFO within seconds
 5. Verify job should check production health and homepage
-6. If using Claude Code: CronCreate should detect the status changes
+6. Claude Code should react to the verify event by running issue-specific checks
 
 ## Troubleshooting
 
