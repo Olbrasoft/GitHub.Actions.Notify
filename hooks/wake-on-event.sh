@@ -176,11 +176,19 @@ process_event() {
                 fi
                 ;;
             code-review-complete)
-                local pr_num pr_url comments
+                local pr_num pr_url comments reviewer is_copilot
                 pr_num=$(echo "$event_data" | jq -r '.prNumber // "unknown"')
                 pr_url=$(echo "$event_data" | jq -r '.prUrl // ""')
                 comments=$(echo "$event_data" | jq -r '.reviewComments // 0')
-                echo "Code review COMPLETE on $repo_name PR #$pr_num: $comments comment(s)"
+                reviewer=$(echo "$event_data" | jq -r '.reviewer // ""')
+                # Copilot's bot login is "copilot-pull-request-reviewer" with
+                # an optional "[bot]" suffix depending on the API surface.
+                # Match the stable prefix so both forms count.
+                case "$reviewer" in
+                    copilot-pull-request-reviewer*) is_copilot=1 ;;
+                    *) is_copilot=0 ;;
+                esac
+                echo "Code review COMPLETE on $repo_name PR #$pr_num by $reviewer: $comments comment(s)"
                 [ -n "$pr_url" ] && echo "PR: $pr_url"
                 echo ""
                 # Advisory text only — never imperative. The wake event can
@@ -196,8 +204,15 @@ process_event() {
                 else
                     echo "If state=OPEN, review the comments and consider whether each is still relevant:"
                     echo "  gh api repos/$repo_name/pulls/$pr_num/comments --jq '.[].body'"
-                    echo "Address relevant ones in the working tree, commit (\"fix: address Copilot review on PR #$pr_num\"), push, then merge:"
+                    echo "Address relevant ones in the working tree, commit (\"fix: address review on PR #$pr_num\"), push, then merge:"
                     echo "  gh pr merge $pr_num --repo $repo_name --merge --delete-branch"
+                    echo ""
+                    if [ "$is_copilot" = "1" ]; then
+                        echo "IMPORTANT (Copilot review): Copilot reviews each PR EXACTLY ONCE. After pushing the fix commits, MERGE THE PR DIRECTLY — do NOT wait for a second review wake event from Copilot. It will never arrive. Source: ~/GitHub/Olbrasoft/engineering-handbook/development-guidelines/workflow/continuous-pr-processing-workflow.md and ci-workflow-monitor SKILL.md Critical Rule #7."
+                    else
+                        echo "NOTE (human reviewer '$reviewer'): unlike Copilot, human reviewers may re-review after a fix push. Before merging, verify the reviewer is satisfied — e.g. check for a follow-up APPROVED review or an explicit acknowledgement. If the reviewer requested changes, wait for them to come back."
+                    fi
+                    echo ""
                     echo "If state=MERGED: comments may already be addressed by later commits in main — verify against current code before doing anything."
                     echo "If state=CLOSED (not merged): skip — the work was abandoned."
                 fi
@@ -209,7 +224,16 @@ process_event() {
                 pr_branch=$(echo "$event_data" | jq -r '.branch // "unknown"')
                 echo "CI $status for $repo_name PR #$pr_num (branch: $pr_branch)"
                 if [ "$status" = "success" ]; then
-                    echo "All CI checks passed. Check if Copilot review is done, then merge PR."
+                    echo "All CI checks passed. Check the latest Copilot review state before deciding:"
+                    echo "  gh pr view $pr_num --repo $repo_name --json reviews \\"
+                    echo "    --jq '[.reviews[] | select(.author.login | startswith(\"copilot-pull-request-reviewer\"))] | last'"
+                    echo "  - null → Copilot has not reviewed yet. Wait for the code-review-complete wake event (the asyncRewake hook re-arms on every Stop, so just continue working)."
+                    echo "  - .state == \"COMMENTED\" with comments you ALREADY addressed → MERGE NOW. Copilot reviews each PR EXACTLY ONCE and will not fire again on push."
+                    echo "  - .state == \"COMMENTED\" with unresolved comments → fix them first (per the earlier code-review-complete advisory), then merge."
+                    echo "  - .state == \"CHANGES_REQUESTED\" → address the requested changes, then merge."
+                    echo "  - .state == \"APPROVED\" → MERGE."
+                    echo "Note: filter by .author.login startswith because gh pr view returns ALL reviews (humans + bots). The 'merge directly after one Copilot review' rule only applies to Copilot. For human reviews, verify the human is satisfied before merging."
+                    echo "Do NOT wait passively for a second Copilot wake event after pushing fixes — it will never arrive."
                 else
                     echo "CI FAILED. Read logs: gh run list --repo $repo_name --branch $pr_branch --limit 1"
                     echo "Fix the issue, push. Notify user via mcp__notify__notify."

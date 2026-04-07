@@ -15,6 +15,7 @@ Fully autonomous issue-to-production pipeline. Given an issue (or parent issue w
 4. **Pipeline processing** — never wait for review, continue with next issue
 5. **Close issues** only after production verification confirms changes are visible
 6. **NEVER say "issue done" after creating a PR** — issue is done ONLY after deploy + Playwright production verification confirms the changes are visible and working. Creating a PR is ~20% of the work.
+7. **Copilot reviews each PR ONCE — but human reviewers may re-review.** This rule applies SPECIFICALLY to the GitHub Copilot review bot (`copilot-pull-request-reviewer`), not to all reviewers. After addressing Copilot's comments and pushing the fix commits, MERGE THE PR DIRECTLY — there is no automatic re-review from Copilot, and waiting for a second wake event from Copilot will hang the session forever. Source of truth: `~/GitHub/Olbrasoft/engineering-handbook/development-guidelines/workflow/continuous-pr-processing-workflow.md` ("no re-review after fixes"). If you ever genuinely want a fresh Copilot pass after pushing fixes, you must explicitly re-request the review via `gh api repos/<OWNER>/<REPO>/pulls/<N>/requested_reviewers -X POST -f reviewers='["Copilot"]'`. Default flow does NOT do this — it just merges.<br/><br/>**Human reviewers** are different: a human may push back after a fix push and submit another review on the same PR. For human-authored reviews (`reviewer` is NOT `copilot-pull-request-reviewer*`), do not assume "merge directly" — verify whether the human is satisfied (e.g. a follow-up `APPROVED` review) before merging, or merge only if you are confident the comments are addressed and no re-review was requested.
 
 ## When Is an Issue "Done"?
 
@@ -45,7 +46,16 @@ An issue is complete ONLY when ALL of these are true:
 Issue assigned
   └── Implement → commit → push → create PR
         ├── WAIT for code review push notification (asyncRewake hook)
-        │     ├── review has comments → fix → push → wait for next review push
+        │     ├── Copilot review with comments → fix → push → MERGE
+        │     │     (Copilot reviews each PR ONCE — no re-review fires
+        │     │      automatically on push. Do NOT wait passively after
+        │     │      pushing fixes; merge directly. See ~/GitHub/Olbrasoft/
+        │     │      engineering-handbook/development-guidelines/workflow/
+        │     │      continuous-pr-processing-workflow.md "no re-review
+        │     │      after fixes". Critical Rule #7.)
+        │     ├── Human review with comments → fix → push → verify
+        │     │     reviewer is satisfied before merging (humans may
+        │     │      re-review unlike Copilot)
         │     └── review clean → MERGE
         ├── WAIT for deploy push notification (asyncRewake hook)
         │     ├── deploy failed → notify error
@@ -207,7 +217,7 @@ When `deploy-complete` has `status: failure`, the `failedStep` field tells you w
 | CI_PENDING | — | Silent wait (CI runs on GitHub cloud) |
 | CI_FAILED | — | Analyze logs → fix → push |
 | CI_PASSED | — | Wait for review push notification |
-| REVIEW_COMPLETE | push (asyncRewake) | Read comments, fix if any → merge |
+| REVIEW_COMPLETE | push (asyncRewake) | Read comments, fix if any → push fixes → MERGE (no re-review will fire — Copilot reviews each PR exactly once, see Critical Rule #7) |
 | PR_MERGED | — | Wait for deploy push notification |
 | DEPLOY_COMPLETE | push (asyncRewake) | Verify production (health + Playwright) |
 | DEPLOY_FAILED | push (asyncRewake) | Notify error |
