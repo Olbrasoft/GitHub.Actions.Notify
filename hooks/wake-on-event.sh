@@ -153,24 +153,24 @@ process_event() {
                 echo "Code review COMPLETE on $repo_name PR #$pr_num: $comments comment(s)"
                 [ -n "$pr_url" ] && echo "PR: $pr_url"
                 echo ""
+                # Advisory text only — never imperative. The wake event can
+                # arrive minutes after the underlying review completed (or
+                # even after the PR is already merged), so Claude must
+                # always verify current PR state before acting. Bug 34.
+                echo "FIRST verify PR state: gh pr view $pr_num --repo $repo_name --json state,mergeable"
                 if [ "$comments" = "0" ]; then
-                    echo "ZERO COMMENTS — execute this single command, no other action allowed before it:"
-                    echo ""
+                    echo "If state=OPEN: merge with"
                     echo "  gh pr merge $pr_num --repo $repo_name --merge --delete-branch"
-                    echo ""
-                    echo "After the merge succeeds, send mcp__notify__notify with the result. Do not report progress before merging. Do not ask the user for permission. Do not switch to other tasks."
+                    echo "If state=MERGED or CLOSED: skip — nothing to do."
                 else
-                    echo "$comments COMMENT(S) — execute this exact sequence in order, no other action allowed in between:"
-                    echo ""
-                    echo "  1. gh api repos/$repo_name/pulls/$pr_num/comments --jq '.[].body'"
-                    echo "  2. Fix every comment in the working tree"
-                    echo "  3. git add -A && git commit -m \"fix: address Copilot review on PR #$pr_num\""
-                    echo "  4. git push"
-                    echo "  5. gh pr merge $pr_num --repo $repo_name --merge --delete-branch"
-                    echo "  6. mcp__notify__notify with the merge result"
-                    echo ""
-                    echo "Steps 1–5 are a single transaction. Do not stop between steps. Do not report progress to the user before step 5 succeeds. Do not ask permission. Do not switch tasks. The fix-and-merge is mandatory and atomic."
+                    echo "If state=OPEN, review the comments and consider whether each is still relevant:"
+                    echo "  gh api repos/$repo_name/pulls/$pr_num/comments --jq '.[].body'"
+                    echo "Address relevant ones in the working tree, commit (\"fix: address Copilot review on PR #$pr_num\"), push, then merge:"
+                    echo "  gh pr merge $pr_num --repo $repo_name --merge --delete-branch"
+                    echo "If state=MERGED: comments may already be addressed by later commits in main — verify against current code before doing anything."
+                    echo "If state=CLOSED (not merged): skip — the work was abandoned."
                 fi
+                echo "Notify user via mcp__notify__notify with the outcome."
                 ;;
             ci-complete)
                 local pr_num pr_branch
