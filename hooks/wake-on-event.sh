@@ -211,15 +211,53 @@ process_event() {
 ###############################################################################
 # Main loop: block on FIFO
 ###############################################################################
+#
+# Producers (wake-claude.sh) terminate each event with a newline (NDJSON
+# framing — bug 33). The consumer reads ONE LINE at a time via `read -r`,
+# which means two events written back-to-back to the same FIFO are read
+# as two separate lines instead of being concatenated by `cat` into a
+# garbled `{...}{...}` blob that fails JSON parse.
+#
+# We open the FIFO once via `exec 3<` and read from FD 3 across all
+# iterations, plus a paired `exec 3>` so the FIFO never reaches EOF
+# from our side when producers close their write end. This avoids the
+# open-close-reopen race where a producer arriving between iterations
+# would block waiting for a reader to re-open.
+
+exec 3<>"$FIFO"
+
+# Re-check that the parent Claude process is still alive. The startup
+# suicide check at the top only fires once, but the loop below blocks
+# for up to 600s in `read`. If the parent dies during that block, the
+# hook gets reparented to systemd-user and would otherwise stay alive
+# forever, accumulating one orphan per dead session. See bug 32.
+parent_alive() {
+    kill -0 "$CLAUDE_PID" 2>/dev/null
+}
 
 while true; do
-    if EVENT_DATA=$(timeout 600 cat "$FIFO" 2>/dev/null); then
-        [ -z "$EVENT_DATA" ] && exit 2
+    if ! parent_alive; then
+        # Parent Claude died while we were idle. Bail out before re-arming
+        # the read so we do not become an orphan.
+        exec 3<&-
+        exit 0
+    fi
+    # Read one NDJSON line with a 600s safety timeout. read returns 0 on
+    # success, non-zero on timeout (no input within 600s) or EOF (no
+    # writers — but FD 3 is also write-open, so we never see real EOF).
+    EVENT_DATA=""
+    if IFS= read -r -t 600 EVENT_DATA <&3; then
+        if ! parent_alive; then
+            exec 3<&-
+            exit 0
+        fi
+        [ -z "$EVENT_DATA" ] && { exec 3<&-; exit 2; }
         process_event "$EVENT_DATA"
+        exec 3<&-
         exit 2
     fi
-    # Timeout: nothing happened in 10 minutes. Refresh manifest with current
-    # cwd (cheap) and loop back.
+    # read timed out: nothing arrived in 600s. Refresh manifest with
+    # current cwd (cheap) and loop back.
     jq -n \
         --argjson pid "$CLAUDE_PID" \
         --arg fifo "$FIFO" \

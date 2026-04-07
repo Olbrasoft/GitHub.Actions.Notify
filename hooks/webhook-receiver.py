@@ -7,12 +7,46 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 9877
 EVENTS_DIR = os.path.expanduser("~/.config/claude-channels/deploy-events")
 os.makedirs(EVENTS_DIR, exist_ok=True)
+
+
+def _reap_in_background(proc):
+    """Wait for a fire-and-forget wake-claude.sh subprocess in a daemon thread.
+
+    Without this, the Popen child stays as a <defunct> entry in the process
+    table until the receiver itself exits. We can't use a SIGCHLD handler
+    here because the receiver also calls subprocess.run() elsewhere (which
+    relies on the default SIGCHLD behaviour). A daemon thread per spawn is
+    cheap, never blocks the main loop, and unambiguously reaps only the
+    children we own. See bug 37.
+
+    Non-zero exit codes are logged to stderr so wake-claude.sh delivery
+    failures are visible in the systemd journal of gh-webhook-forward.service.
+    """
+    def _wait():
+        try:
+            returncode = proc.wait()
+            if returncode != 0:
+                print(
+                    f"[webhook-receiver] Wake subprocess exited with status "
+                    f"{returncode}: {proc.args}",
+                    file=sys.stderr,
+                )
+        except Exception as e:
+            print(
+                f"[webhook-receiver] Failed waiting for wake subprocess "
+                f"{proc.args}: {e}",
+                file=sys.stderr,
+            )
+
+    t = threading.Thread(target=_wait, daemon=True)
+    t.start()
 
 
 def _wake(repo_name, branch=None):
@@ -29,7 +63,11 @@ def _wake(repo_name, branch=None):
         # child or leak file descriptors over time. wake-claude.sh's own
         # stderr is preserved by the systemd journal of gh-webhook-forward.service
         # if we ever need to debug it; for that, run wake-claude.sh manually.
-        subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Reap the child in a background thread so it does not become a
+        # zombie. wake-claude.sh can take up to WAKE_CLAUDE_RETRY_SECS to
+        # finish; we never want to block the receiver waiting for it.
+        _reap_in_background(proc)
         branch_info = f" branch={branch}" if branch else ""
         print(f"[webhook-receiver] Wake signal sent for {repo_name}{branch_info}",
               file=sys.stderr)
