@@ -145,7 +145,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
         repo = payload.get("repository", {})
         repo_name = repo.get("full_name", "unknown")
         repo_file = repo_name.replace("/", "-")
-        head_sha = check_suite.get("head_sha", "unknown")[:7]
+        head_sha = check_suite.get("head_sha", "unknown")
+        head_sha_short = head_sha[:7] if head_sha != "unknown" else head_sha
         head_branch = check_suite.get("head_branch", "")
 
         # Only for PRs — check if there are associated pull requests
@@ -162,7 +163,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
         # to wait for, OR there may still be checks in progress.
         agg = self._aggregate_pr_checks(repo_name, pr_number)
         if agg is None:
-            print(f"[webhook-receiver] PR #{pr_number}: gh pr checks failed, skipping wake",
+            print(f"[webhook-receiver] PR #{pr_number}: gh pr view --json statusCheckRollup "
+                  f"failed, skipping wake",
                   file=sys.stderr)
             return
 
@@ -177,7 +179,10 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
         # Idempotency: if we have already emitted an event for this exact
         # (PR, head SHA, status) tuple in a recent file, skip. We use the
-        # event filename as the idempotency key — it includes the head SHA.
+        # event filename as the idempotency key — it includes the FULL head
+        # SHA (40 chars). Truncated 7-char SHAs are not guaranteed unique
+        # and could let one commit's event clobber another commit's event
+        # for the same PR.
         event_file = os.path.join(EVENTS_DIR, f"{repo_file}-ci-{pr_number}-{head_sha}.json")
         if os.path.exists(event_file):
             try:
@@ -185,7 +190,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
                     existing = json.load(f)
                 if existing.get("status") == final_status:
                     print(f"[webhook-receiver] PR #{pr_number}: ci-complete with "
-                          f"status={final_status} for {head_sha} already emitted, skipping",
+                          f"status={final_status} for {head_sha_short} already emitted, skipping",
                           file=sys.stderr)
                     return
             except (json.JSONDecodeError, OSError):
@@ -196,7 +201,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             "status": final_status,
             "repository": repo_name,
             "prNumber": pr_number,
-            "commit": head_sha,
+            "commit": head_sha_short,
             "branch": pr_branch,
             "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
@@ -210,14 +215,14 @@ class WebhookHandler(BaseHTTPRequestHandler):
         os.rename(tmp_file, event_file)
 
         print(f"[webhook-receiver] CI {final_status} event written: {repo_name} PR #{pr_number} "
-              f"(branch: {pr_branch}, commit: {head_sha}, "
+              f"(branch: {pr_branch}, commit: {head_sha_short}, "
               f"checks: {agg['success']}s/{agg['failure']}f/{agg['skipped']}skip)",
               file=sys.stderr)
 
         _wake(repo_name, pr_branch)
 
     def _aggregate_pr_checks(self, repo_name, pr_number):
-        """Query `gh pr checks` for the aggregate status of all checks on a PR.
+        """Query `gh pr view --json statusCheckRollup` for the aggregate status of all checks on a PR.
 
         Returns a dict with keys:
           all_terminal (bool): True if every check is in a terminal state
@@ -255,9 +260,12 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 continue
             if conclusion == "SUCCESS":
                 success += 1
-            elif conclusion == "FAILURE":
+            elif conclusion in ("FAILURE", "CANCELLED"):
+                # CANCELLED checks are non-success and should block merging.
+                # If a check was cancelled (manually or by infra), the
+                # consumer must NOT treat the PR as cleanly green.
                 failure += 1
-            elif conclusion in ("SKIPPED", "NEUTRAL", "CANCELLED"):
+            elif conclusion in ("SKIPPED", "NEUTRAL"):
                 skipped += 1
             elif not conclusion:
                 # Empty conclusion typically means still pending in some

@@ -401,13 +401,14 @@ process_event_file() {
 #   Olbrasoft-cr-verify-abc1234-241234-1.json
 #   Olbrasoft-cr-verify-abc1234-241235-1.json   # re-run
 #
-# Both files contain the same (event_type, commit) tuple. We pick the file
-# with the LATEST timestamp inside the JSON for each (event_type, commit)
-# key, deliver only that one, and drop the rest. This ensures the consumer
-# session is woken at most once per logical event per wake-claude.sh call.
+# Both files contain the same (event_type, commit, environment) tuple. We
+# pick the file with the LATEST timestamp inside the JSON for each tuple,
+# deliver only that one, and drop the rest. The dedup key includes the
+# environment so events for staging vs production on the same commit are
+# NOT treated as duplicates.
 
-declare -A event_winner   # key: "event_type|commit" → file path
-declare -A event_winner_ts  # key: "event_type|commit" → timestamp
+declare -A event_winner   # key: "event_type|commit|env" → file path
+declare -A event_winner_ts  # key: "event_type|commit|env" → timestamp
 
 for ef in "$EVENTS_DIR"/${REPO_FILE}*.json; do
     [ -f "$ef" ] || continue
@@ -418,12 +419,13 @@ for ef in "$EVENTS_DIR"/${REPO_FILE}*.json; do
     fi
     et=$(jq -r '.event // ""' "$ef" 2>/dev/null)
     sha=$(jq -r '.commit // ""' "$ef" 2>/dev/null)
+    env=$(jq -r '.environment // ""' "$ef" 2>/dev/null)
     ts=$(jq -r '.timestamp // ""' "$ef" 2>/dev/null)
     # If we cannot identify the logical key, treat the file as unique.
     if [ -z "$et" ] || [ -z "$sha" ]; then
         continue
     fi
-    key="$et|$sha"
+    key="$et|$sha|$env"
     if [ -z "${event_winner[$key]:-}" ] || [[ "$ts" > "${event_winner_ts[$key]:-}" ]]; then
         # Drop the previous winner for this key (it is a logical duplicate
         # superseded by a newer file).
