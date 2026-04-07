@@ -257,7 +257,9 @@ For each pr-owners/{my_repo}-*.json:
         leave alone (better orphan than lost state)
 ```
 
-Adoption is restricted to the cwd's git repo (so a session in repo A does not adopt PRs from repo B), and runs in under 5 seconds bounded by `timeout 5 gh pr view`. Multi-terminal in the same project: whichever session adopts first wins; subsequent sessions see the record as live and skip it. No double delivery.
+Adoption is restricted to the cwd's git repo (so a session in repo A does not adopt PRs from repo B). Each `gh pr view` call is bounded by `timeout 5`, but the scan performs that check **once per orphaned record**, so total session-start time is proportional to the number of orphans. With a typical 1–3 open PRs per project the scan completes well under 15 seconds; with many orphans it can be longer. The scan never blocks the assistant — it runs as part of the asyncRewake hook between turns, not on a user prompt.
+
+Multi-terminal in the same project enforces strict first-wins: the adoption rewrite is serialized via `flock -x` on a per-owner-file lock and uses a compare-and-swap check (re-read the record under the lock and only rewrite if `pid` still equals the dead value we observed). Subsequent sessions either see the record as live (`kill -0` succeeds and the FIFO exists) or fail the CAS check, so no double delivery is possible.
 
 This closes the gap for users who close and reopen Claude Code mid-workflow:
 

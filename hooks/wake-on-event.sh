@@ -116,6 +116,37 @@ jq -n \
 # This is a best-effort scan: if `gh` is missing or the API is slow, we
 # skip the PR-state check rather than blocking session startup. The
 # scan runs at most once per asyncRewake spawn, which is bounded.
+# Decide whether a recorded owner should be considered alive. A live owner
+# is one whose PID is a real, running process AND whose registered FIFO
+# still exists. The FIFO check guards against PID reuse — a recycled PID
+# could otherwise be mistaken for the original owner.
+owner_is_live() {
+    local pid="$1"
+    local fifo="$2"
+
+    # Reject empty, non-numeric, and pid <= 1 (init/group). `kill -0 0` would
+    # otherwise succeed because it targets the current process group, which
+    # would be wrong here.
+    case "$pid" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    if [ "$pid" -le 1 ]; then
+        return 1
+    fi
+
+    if ! kill -0 "$pid" 2>/dev/null; then
+        return 1
+    fi
+
+    # FIFO must exist (and be a FIFO). If the FIFO is gone, the original
+    # session has cleaned up and the PID has likely been reused.
+    if [ -z "$fifo" ] || [ ! -p "$fifo" ]; then
+        return 1
+    fi
+
+    return 0
+}
+
 adopt_orphans() {
     [ -d "$PR_OWNERS_DIR" ] || return 0
 
@@ -129,44 +160,95 @@ adopt_orphans() {
     for owner in "$PR_OWNERS_DIR"/${my_repo}-*.json; do
         [ -f "$owner" ] || continue
 
-        local owner_pid owner_repo owner_pr
+        local owner_pid owner_fifo owner_repo owner_pr owner_url
         owner_pid=$(jq -r '.pid // 0' "$owner" 2>/dev/null)
+        owner_fifo=$(jq -r '.fifo // ""' "$owner" 2>/dev/null)
         owner_repo=$(jq -r '.repo // ""' "$owner" 2>/dev/null)
         owner_pr=$(jq -r '.pr // 0' "$owner" 2>/dev/null)
+        owner_url=$(jq -r '.url // ""' "$owner" 2>/dev/null)
 
         # Only process records for our repo (the glob is broad — *-*-*.json)
         [ "$owner_repo" = "$my_repo" ] || continue
         [ "$owner_pr" -gt 0 ] || continue
 
         # Skip live owners
-        if kill -0 "$owner_pid" 2>/dev/null; then
+        if owner_is_live "$owner_pid" "$owner_fifo"; then
+            continue
+        fi
+
+        # Derive owner/repo from the stored URL rather than reconstructing it
+        # from the dashed file prefix. The dashed form is not invertible when
+        # the GitHub owner or repo name itself contains a dash (for example
+        # "my-org/my-repo" → "my-org-my-repo"), so we cannot rely on
+        # "${my_repo/-//}". The URL is the canonical source of truth.
+        local pr_full_repo=""
+        if [[ "$owner_url" =~ github\.com/([^/]+)/([^/]+)/pull/[0-9]+ ]]; then
+            pr_full_repo="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+        fi
+        if [ -z "$pr_full_repo" ]; then
+            echo "[wake-on-event] Cannot derive owner/repo from $owner.url, skipping" >&2
             continue
         fi
 
         # Verify the PR is still open on GitHub. If gh fails, leave the
         # record alone — better to keep an orphan than to lose state.
+        # Each call is bounded by 5s; total scan time is per_record × records.
         local pr_state
         pr_state=$(timeout 5 gh pr view "$owner_pr" \
-            --repo "${my_repo/-//}" \
+            --repo "$pr_full_repo" \
             --json state \
             --jq '.state' 2>/dev/null)
 
         case "$pr_state" in
             OPEN)
-                # Adopt: replace pid + fifo, add adopted_at marker
-                local tmp="$owner.adopt.$$"
-                if jq \
-                    --argjson pid "$CLAUDE_PID" \
-                    --arg fifo "$FIFO" \
-                    --arg adopted "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-                    '.pid = $pid | .fifo = $fifo | .adopted_at = $adopted' \
-                    "$owner" > "$tmp" 2>/dev/null; then
-                    mv "$tmp" "$owner"
+                # Adopt with strict first-wins: take an exclusive lock on the
+                # owner file, re-read the record under the lock, only rewrite
+                # if it still points at the same dead PID we observed
+                # (compare-and-swap). A racing session that already adopted
+                # the record would have changed the PID, so we would back off.
+                local lock_file="$owner.lock"
+                (
+                    if flock -x -w 5 9; then
+                        local cur_pid cur_repo cur_pr cur_fifo
+                        cur_pid=$(jq -r '.pid // 0' "$owner" 2>/dev/null)
+                        cur_fifo=$(jq -r '.fifo // ""' "$owner" 2>/dev/null)
+                        cur_repo=$(jq -r '.repo // ""' "$owner" 2>/dev/null)
+                        cur_pr=$(jq -r '.pr // 0' "$owner" 2>/dev/null)
+
+                        # Check the record still matches the same orphan AND is
+                        # still dead. If another session already adopted it,
+                        # cur_pid would now be alive and we back off.
+                        if [ -f "$owner" ] \
+                            && [ "$cur_pid" = "$owner_pid" ] \
+                            && [ "$cur_repo" = "$owner_repo" ] \
+                            && [ "$cur_pr" = "$owner_pr" ] \
+                            && ! owner_is_live "$cur_pid" "$cur_fifo"; then
+                            local tmp="$owner.adopt.$$"
+                            if jq \
+                                --argjson pid "$CLAUDE_PID" \
+                                --arg fifo "$FIFO" \
+                                --arg adopted "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                                '.pid = $pid | .fifo = $fifo | .adopted_at = $adopted' \
+                                "$owner" > "$tmp" 2>/dev/null; then
+                                mv "$tmp" "$owner"
+                                echo "[wake-on-event] Adopted PR #$owner_pr from dead PID $owner_pid" >&2
+                                exit 0
+                            else
+                                rm -f "$tmp"
+                            fi
+                        fi
+                        exit 1
+                    else
+                        echo "[wake-on-event] Could not acquire lock for $owner, skipping" >&2
+                        exit 2
+                    fi
+                ) 9>"$lock_file"
+                if [ "$?" -eq 0 ]; then
                     adopted=$((adopted + 1))
-                    echo "[wake-on-event] Adopted PR #$owner_pr from dead PID $owner_pid" >&2
-                else
-                    rm -f "$tmp"
                 fi
+                # Best-effort cleanup of the lock file (the lock itself was
+                # already released when the subshell exited).
+                rm -f "$lock_file"
                 ;;
             MERGED|CLOSED)
                 # PR is no longer interesting — clean up the orphan record
