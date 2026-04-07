@@ -123,10 +123,32 @@ process_event() {
         return 1
     fi
 
-    local event_type status repo_name
+    local event_type status repo_name event_ts event_age_seconds event_age_human
     event_type=$(echo "$event_data" | jq -r '.event // "unknown"')
     status=$(echo "$event_data" | jq -r '.status // "unknown"')
     repo_name=$(echo "$event_data" | jq -r '.repository // "unknown"')
+    event_ts=$(echo "$event_data" | jq -r '.timestamp // ""')
+
+    # Compute age of the event (now - timestamp). This lets the feedback
+    # log entry record observed delay so cross-session pattern analysis
+    # can spot late deliveries. Issue #40.
+    event_age_seconds=""
+    event_age_human=""
+    if [ -n "$event_ts" ]; then
+        local ts_epoch now_epoch
+        ts_epoch=$(date -u -d "$event_ts" +%s 2>/dev/null || echo "")
+        now_epoch=$(date -u +%s)
+        if [ -n "$ts_epoch" ]; then
+            event_age_seconds=$((now_epoch - ts_epoch))
+            if [ "$event_age_seconds" -lt 60 ]; then
+                event_age_human="${event_age_seconds}s"
+            elif [ "$event_age_seconds" -lt 3600 ]; then
+                event_age_human="$((event_age_seconds / 60))m"
+            else
+                event_age_human="$((event_age_seconds / 3600))h$((event_age_seconds / 60 % 60))m"
+            fi
+        fi
+    fi
 
     {
         case "$event_type" in
@@ -204,6 +226,31 @@ process_event() {
                 echo "CI event: $event_type ($status) for $repo_name"
                 ;;
         esac
+
+        # Cross-session feedback log instructions. After acting (or
+        # deciding not to), Claude should append a one-line evaluation to
+        # the shared feedback log so future sessions can spot patterns
+        # without relying on the original session being alive. Issue #40.
+        echo ""
+        if [ -n "$event_age_human" ]; then
+            echo "EVENT AGE: $event_age_human (event timestamp: $event_ts)"
+        fi
+        echo "AFTER acting (or skipping), append a feedback entry:"
+        echo "  ~/.claude/hooks/log-wake-feedback.sh \\"
+        echo "    event=$event_type \\"
+        echo "    repo=$repo_name \\"
+        echo "    classification=ok|late|stale|garbled|wrong-target|other \\"
+        if [ -n "$event_age_human" ]; then
+            echo "    delay=$event_age_human \\"
+        fi
+        echo "    note=\"<one-line summary of what you did or why you skipped>\""
+        echo "Pick the classification that best describes how this event interacted with current state:"
+        echo "  ok           — event arrived in time, action taken cleanly"
+        echo "  late         — event arrived after a noticeable delay but action still applicable"
+        echo "  stale        — event arrived after the underlying state already changed (e.g. PR already merged)"
+        echo "  garbled      — event payload was malformed or partially read"
+        echo "  wrong-target — event was for a different session/branch than the one it landed on"
+        echo "  other        — anything else worth recording"
     } >&2
 
     return 0
