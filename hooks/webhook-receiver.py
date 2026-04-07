@@ -25,12 +25,25 @@ def _reap_in_background(proc):
     relies on the default SIGCHLD behaviour). A daemon thread per spawn is
     cheap, never blocks the main loop, and unambiguously reaps only the
     children we own. See bug 37.
+
+    Non-zero exit codes are logged to stderr so wake-claude.sh delivery
+    failures are visible in the systemd journal of gh-webhook-forward.service.
     """
     def _wait():
         try:
-            proc.wait()
-        except Exception:
-            pass
+            returncode = proc.wait()
+            if returncode != 0:
+                print(
+                    f"[webhook-receiver] Wake subprocess exited with status "
+                    f"{returncode}: {proc.args}",
+                    file=sys.stderr,
+                )
+        except Exception as e:
+            print(
+                f"[webhook-receiver] Failed waiting for wake subprocess "
+                f"{proc.args}: {e}",
+                file=sys.stderr,
+            )
 
     t = threading.Thread(target=_wait, daemon=True)
     t.start()

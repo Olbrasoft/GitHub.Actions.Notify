@@ -65,13 +65,38 @@ PROJECTS_DIR="$HOME/.claude/projects"
 WRITE_RETRY_SECS="${WAKE_CLAUDE_RETRY_SECS:-300}"
 WRITE_TIMEOUT="${WAKE_CLAUDE_WRITE_TIMEOUT:-3}"
 
-[ -d "$EVENTS_DIR" ] || exit 0
-
 ###############################################################################
 # Helpers
 ###############################################################################
 
 log() { echo "[wake-claude] $*" >&2; }
+
+# Sweep stale per-session FIFOs and manifests for dead Claude PIDs.
+# Defined and called BEFORE the EVENTS_DIR existence check (#36 follow-up
+# from Copilot review on PR #38) so that the sweep runs even when there
+# are no pending events to deliver — otherwise stale FIFOs accumulate
+# indefinitely on systems where deploy-events has not yet been created.
+sweep_stale_session_files() {
+    local f pid
+    [ -d "$WAKE_DIR" ] || return 0
+    for f in "$WAKE_DIR"/.session-*.fifo "$WAKE_DIR"/.session-*.json; do
+        [ -e "$f" ] || continue
+        pid="${f##*/.session-}"
+        pid="${pid%.fifo}"
+        pid="${pid%.json}"
+        # Numeric PID check — skip anything that does not match the pattern.
+        case "$pid" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        if ! kill -0 "$pid" 2>/dev/null; then
+            log "Sweeping stale ${f##*/} (PID $pid dead)"
+            rm -f "$f"
+        fi
+    done
+}
+sweep_stale_session_files
+
+[ -d "$EVENTS_DIR" ] || exit 0
 
 # Get the local repo path for cwd matching. We use the basename of the repo.
 # E.g. "Olbrasoft/VirtualAssistant" → "VirtualAssistant"
@@ -395,37 +420,6 @@ process_event_file() {
         rm -f "$event_file"
     fi
 }
-
-###############################################################################
-# Sweep stale per-session FIFOs and manifests for dead Claude PIDs
-###############################################################################
-#
-# wake-on-event.sh installs a cleanup() trap that removes its FIFO + manifest
-# when the script exits AND the Claude PID is dead. But the trap only fires
-# inside a *running* hook process. If the Claude session dies while no hook
-# is currently in cat (the asyncRewake hook only spawns at SessionStart/Stop
-# boundaries), the trap never runs and the FIFO leaks. See bug 36.
-#
-# We sweep at the start of every wake-claude.sh invocation: cheap, idempotent,
-# and runs whenever there is wake activity for any repo.
-sweep_stale_session_files() {
-    local f pid
-    for f in "$WAKE_DIR"/.session-*.fifo "$WAKE_DIR"/.session-*.json; do
-        [ -e "$f" ] || continue
-        pid="${f##*/.session-}"
-        pid="${pid%.fifo}"
-        pid="${pid%.json}"
-        # Numeric PID check — skip anything that does not match the pattern.
-        case "$pid" in
-            ''|*[!0-9]*) continue ;;
-        esac
-        if ! kill -0 "$pid" 2>/dev/null; then
-            log "Sweeping stale ${f##*/} (PID $pid dead)"
-            rm -f "$f"
-        fi
-    done
-}
-sweep_stale_session_files
 
 ###############################################################################
 # Main: process all event files for this repo
