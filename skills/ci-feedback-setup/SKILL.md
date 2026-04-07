@@ -110,6 +110,9 @@ Read the existing `.github/workflows/ci.yml` (or deploy workflow). The deploy jo
         mkdir -p "$EVENTS_DIR"
         REPO_FILE="${GITHUB_REPOSITORY//\//-}"
         COMMIT_SHA="${GITHUB_SHA:0:7}"
+        # RUN_ID + RUN_ATTEMPT ensure filename uniqueness even for re-runs
+        # and workflow_dispatch of the same commit (COMMIT_SHA alone is not
+        # enough — re-runs of the same SHA would otherwise collide).
 
         # Detect which step failed — customize these step IDs for this project!
         FAILED_STEP=""
@@ -130,7 +133,7 @@ Read the existing `.github/workflows/ci.yml` (or deploy workflow). The deploy jo
             --arg environment "production" \
             --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             '{event: $event, status: $status, failedStep: $failedStep, repository: $repository, commit: $commit, commitMessage: $commitMessage, runUrl: $runUrl, environment: $environment, timestamp: $timestamp}' \
-            > "$EVENTS_DIR/${REPO_FILE}-deploy-${COMMIT_SHA}.json"
+            > "$EVENTS_DIR/${REPO_FILE}-deploy-${COMMIT_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
 
           # Wake ALL Claude Code sessions for this repo via FIFO. wake-claude.sh
           # uses ack semantics: it deletes the event file ONLY after a live
@@ -180,6 +183,7 @@ Read the existing `.github/workflows/ci.yml` (or deploy workflow). The deploy jo
           mkdir -p "$EVENTS_DIR"
           REPO_FILE="${GITHUB_REPOSITORY//\//-}"
           COMMIT_SHA="${GITHUB_SHA:0:7}"
+          # RUN_ID + RUN_ATTEMPT ensure filename uniqueness across re-runs.
 
           if command -v jq >/dev/null 2>&1; then
             jq -n \
@@ -190,7 +194,7 @@ Read the existing `.github/workflows/ci.yml` (or deploy workflow). The deploy jo
               --arg environment "production" \
               --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
               '{event: $event, status: $status, repository: $repository, commit: $commit, environment: $environment, timestamp: $timestamp}' \
-              > "$EVENTS_DIR/${REPO_FILE}-verify-${COMMIT_SHA}.json"
+              > "$EVENTS_DIR/${REPO_FILE}-verify-${COMMIT_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
 
             WAKE_SCRIPT="$HOME/.claude/hooks/wake-claude.sh"
             if [ -x "$WAKE_SCRIPT" ]; then

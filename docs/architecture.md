@@ -92,12 +92,22 @@ The two channels are independent. A project may use either, both, or neither. Th
 
 ### Filename uniqueness
 
-Event filenames include a discriminator (commit SHA for deploy/verify events, PR number for code review events) so two events for the same repo can coexist on disk. Sequential deploys never overwrite each other.
+Event filenames include a discriminator so two events for the same repo can coexist on disk. Sequential deploys never overwrite each other:
+
+| Event | Filename |
+|---|---|
+| deploy | `{repo}-deploy-{commit_sha}-{run_id}-{run_attempt}.json` |
+| verify | `{repo}-verify-{commit_sha}-{run_id}-{run_attempt}.json` |
+| code review | `{repo}-review-{pr_number}.json` |
+
+`COMMIT_SHA` alone is not enough — workflow `re-run` and `workflow_dispatch` of the same commit would still collide. `GITHUB_RUN_ID` + `GITHUB_RUN_ATTEMPT` make every deploy/verify event globally unique per workflow run.
+
+Code review events use the PR number because each Copilot review naturally arrives once per PR; if multiple reviews arrive for the same PR (rare but possible), the consumer is woken once per arrival.
 
 ```
-Olbrasoft-VirtualAssistant-deploy-32f4d49.json
-Olbrasoft-VirtualAssistant-deploy-637deaa.json
-Olbrasoft-VirtualAssistant-verify-637deaa.json
+Olbrasoft-VirtualAssistant-deploy-32f4d49-24079371158-1.json
+Olbrasoft-VirtualAssistant-deploy-637deaa-24079394530-1.json
+Olbrasoft-VirtualAssistant-verify-637deaa-24079412345-1.json
 Olbrasoft-VirtualAssistant-review-924.json
 ```
 
