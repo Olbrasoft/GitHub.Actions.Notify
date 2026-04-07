@@ -62,7 +62,18 @@ fi
 EVENTS_DIR="$HOME/.config/claude-channels/deploy-events"
 WAKE_DIR="/tmp/claude-wake"
 PROJECTS_DIR="$HOME/.claude/projects"
-WRITE_RETRY_SECS="${WAKE_CLAUDE_RETRY_SECS:-300}"
+# Retry deadline for FIFO writes when no consumer is currently reading.
+# wake-on-event.sh is an asyncRewake hook that only spawns at SessionStart/
+# Stop boundaries, so mid-session there is no reader on the FIFO. We retry
+# briefly so a hook spawning right after a Stop event still picks up the
+# write, then we give up and let the file remain on disk for the
+# UserPromptSubmit fallback (check-deploy-status.sh) to surface the event
+# on Claude's next prompt. Bug 35.
+#
+# Old default was 300s, which caused multiple wake-claude.sh processes to
+# stack up retrying the same Claude PID's FIFO and creating producer races.
+# 60s is enough for the typical Stop→hook spawn latency.
+WRITE_RETRY_SECS="${WAKE_CLAUDE_RETRY_SECS:-60}"
 WRITE_TIMEOUT="${WAKE_CLAUDE_WRITE_TIMEOUT:-3}"
 
 ###############################################################################
@@ -416,8 +427,12 @@ process_event_file() {
         rm -f "$event_file"
         log "DELIVERED ${event_file##*/} → PID $target_pid (PR=${pr_num:-?})"
     else
-        log "DROP after ${WRITE_RETRY_SECS}s retry: ${event_file##*/} (PID $target_pid, PR=${pr_num:-?})"
-        rm -f "$event_file"
+        # Bug 35: do NOT delete the event file on retry-exhaustion. Leave
+        # it on disk so the UserPromptSubmit fallback hook
+        # (check-deploy-status.sh) picks it up on Claude's next prompt.
+        # Without this fallback, a wake event arriving while no hook is
+        # currently in `read` is silently lost after WRITE_RETRY_SECS.
+        log "DEFER ${event_file##*/} → PID $target_pid (PR=${pr_num:-?}) — file kept for UserPromptSubmit fallback"
     fi
 }
 
