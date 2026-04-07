@@ -1,275 +1,119 @@
 #!/bin/bash
-# asyncRewake hook for Claude Code: per-session FIFO consumer.
+# wake-on-event.sh — asyncRewake hook for Claude Code.
 #
-# Session-bound design (see docs/architecture.md):
-#   - Each Claude session has ONE FIFO at /tmp/claude-wake/.session-{PID}.fifo
-#     (regardless of how many repos the session works in).
-#   - The FIFO is referenced by the session manifest at
-#     /tmp/claude-wake/.session-{PID}.json which records pid + fifo path.
-#   - PR ownership lives in ~/.config/claude-channels/pr-owners/ — created by
-#     the PostToolUse auto-register hook when `gh pr create` succeeds. This
-#     hook does NOT manage ownership — it only owns the FIFO.
-#   - Cleanup on EXIT removes the FIFO, the session manifest, and any
-#     ~/.config/claude-channels/pr-owners/*.json that points at this PID.
-#     A dead session leaves no orphans.
+# Per-session FIFO consumer. Runs as a Stop and SessionStart hook with
+# `asyncRewake: true`. The script blocks on a named pipe; when an external
+# producer (wake-claude.sh) writes an event, the script processes it and
+# `exit 2`s, which causes Claude Code to inject the stderr output as a
+# system reminder into the next model turn.
+#
+# Design constraints (per user direction):
+#   - NO PR registry, NO inbox files, NO adoption, NO background daemons.
+#   - The Notifier (wake-claude.sh) finds this session by enumerating live
+#     `claude` processes via pgrep + /proc/PID/cwd. There is nothing to
+#     register here.
 #
 # Lifecycle:
-#   1. Spawned by Claude Code on SessionStart and on every Stop event
-#      (asyncRewake true).
-#   2. Walk up the process tree to find the Claude PID (the parent of this
-#      hook subprocess).
-#   3. Create FIFO + manifest if they don't already exist.
-#   4. Block on `cat $FIFO` with a 600s timeout.
-#   5. On read: process the event payload, write instructions to stderr,
-#      exit 2 — Claude Code re-prompts the assistant with the stderr as a
-#      system reminder, achieving the "wake".
-#   6. On timeout: just loop back. The wake mechanism is event-driven; the
-#      timeout exists only so the cat doesn't block forever in case
-#      something goes wrong.
-#   7. On real EXIT (Claude session ends, hook is killed): the trap fires
-#      and removes everything.
+#   1. Spawned by Claude Code on SessionStart and on every Stop event.
+#   2. Walks up the process tree to find the parent Claude PID.
+#   3. **Suicide check:** if no Claude ancestor exists, this hook is an
+#      orphan (the session that spawned it has died and we got reparented
+#      to systemd-user). Exit immediately, taking nothing with us.
+#   4. **Singleton check:** if another wake-on-event.sh is already reading
+#      the same FIFO for the same Claude PID, exit immediately. Multiple
+#      readers per FIFO cause kernel-level event stealing.
+#   5. Create the per-session FIFO if missing and write a manifest.
+#   6. Block on `cat $FIFO` with a 600s safety timeout.
+#   7. On read: process the event, write instructions to stderr, exit 2.
+#   8. On real EXIT (Claude session dead): cleanup() removes FIFO and manifest.
 
 set -u
 
 WAKE_DIR="/tmp/claude-wake"
-PR_OWNERS_DIR="$HOME/.config/claude-channels/pr-owners"
+mkdir -p "$WAKE_DIR"
 
-mkdir -p "$WAKE_DIR" "$PR_OWNERS_DIR"
+###############################################################################
+# Process tree walking
+###############################################################################
 
-# Find the Claude process PID by walking up the process tree from this hook.
-# Try each ancestor and stop at the first one whose comm is "claude".
+# Find the Claude PID by walking up from this script's parent. Returns the
+# PID on stdout if found, empty string otherwise.
 find_claude_pid() {
     local pid=$PPID
     local i=0
-    while [ "$pid" != "1" ] && [ "$i" -lt 10 ]; do
+    while [ "$pid" -gt 1 ] && [ "$i" -lt 10 ]; do
         local comm
-        comm=$(cat "/proc/$pid/comm" 2>/dev/null || echo "")
+        comm=$(cat "/proc/$pid/comm" 2>/dev/null) || break
         if [ "$comm" = "claude" ]; then
             echo "$pid"
             return 0
         fi
-        pid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null || echo 1)
+        pid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null) || break
         i=$((i + 1))
     done
-    # Fallback: use direct parent PID. Better than nothing.
-    echo "$PPID"
+    echo ""
 }
 
 CLAUDE_PID=$(find_claude_pid)
+
+# Suicide check: if no Claude ancestor, we're an orphan. The original
+# session that spawned us has died and we've been reparented to systemd-user.
+# Don't keep listening on a FIFO that has no consumer.
+if [ -z "$CLAUDE_PID" ]; then
+    exit 0
+fi
+
 FIFO="$WAKE_DIR/.session-${CLAUDE_PID}.fifo"
 MANIFEST="$WAKE_DIR/.session-${CLAUDE_PID}.json"
 
-# Cleanup on real exit only (not on exit 2 → Claude re-spawns us). The
-# distinction matters because exit 2 is the "wake" signal: we want the
-# session to keep its FIFO so the NEXT spawned hook instance picks up
-# delivery. Cleanup must only happen when the Claude process itself is
-# really gone.
+# NOTE: there is no singleton check. Multiple wake-on-event.sh instances per
+# session are intentional: Claude Code spawns a new hook on every Stop event,
+# and old instances stay blocked on `cat $FIFO` until either (a) they receive
+# an event and exit 2, or (b) their 600s timeout expires. Multiple readers
+# blocked on the same FIFO are a feature — when wake-claude.sh writes one
+# event, the kernel atomically delivers it to exactly one reader; the others
+# stay alive and act as backup readers for subsequent events. This makes the
+# wake mechanism more resilient to bursts.
+
+###############################################################################
+# Cleanup on real exit (not on exit 2 — Claude Code respawns the hook then)
+###############################################################################
+
 cleanup() {
-    # Only purge if the parent Claude process is dead. Otherwise this is
-    # an exit-2 cycle and the FIFO is still needed.
+    # Only purge if the parent Claude process is dead. exit 2 keeps the
+    # session alive and we want the FIFO preserved for the next spawn.
     if ! kill -0 "$CLAUDE_PID" 2>/dev/null; then
         rm -f "$FIFO" "$MANIFEST"
-        # Drop any PR ownerships for this PID — dead owner = drop all events
-        for owner in "$PR_OWNERS_DIR"/*.json; do
-            [ -f "$owner" ] || continue
-            local_pid=$(jq -r '.pid // 0' "$owner" 2>/dev/null)
-            if [ "$local_pid" = "$CLAUDE_PID" ]; then
-                rm -f "$owner"
-            fi
-        done
     fi
 }
 trap cleanup EXIT
 
-# Create FIFO + manifest if missing. The hook is spawned multiple times
-# during a session (SessionStart + every Stop), so this must be idempotent.
+###############################################################################
+# Create FIFO + manifest if missing (idempotent across hook spawns)
+###############################################################################
+
 if [ ! -p "$FIFO" ]; then
     rm -f "$FIFO"
     mkfifo "$FIFO" 2>/dev/null || exit 0
 fi
 
-# Write/refresh the session manifest. cwd may have changed since the last
-# run if the user navigated, but PID and FIFO are stable.
+# Write a small manifest so external tools can discover this session.
+# (wake-claude.sh does NOT use the manifest — it enumerates via pgrep.
+# The manifest is informational only.)
 jq -n \
     --argjson pid "$CLAUDE_PID" \
     --arg fifo "$FIFO" \
     --arg cwd "$(pwd)" \
     --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    '{pid: $pid, fifo: $fifo, cwd: $cwd, created: $created}' > "$MANIFEST"
+    '{pid: $pid, fifo: $fifo, cwd: $cwd, created: $created}' > "$MANIFEST" 2>/dev/null
 
-# Adopt orphaned PR ownerships from previous (now-dead) sessions for this
-# repo. The use case: user creates PRs in a Claude session, closes it, opens
-# a new one in the same project — they expect the new session to receive
-# pending events for those PRs and continue the workflow autonomously.
-#
-# Adoption rules:
-#   1. Only owner records for the cwd's git repo are considered (so a
-#      session in repo A does not adopt PRs from repo B).
-#   2. Only records whose pid is dead (kill -0 fails) are adopted —
-#      a live owner is left alone.
-#   3. The PR must still be OPEN on GitHub. Closed/merged PRs are not
-#      relevant; their owner records are deleted.
-#   4. Adoption is silent (no events are delivered as a side effect).
-#      The next event from GitHub will be routed to the new owner via
-#      wake-claude.sh as usual.
-#
-# This is a best-effort scan: if `gh` is missing or the API is slow, we
-# skip the PR-state check rather than blocking session startup. The
-# scan runs at most once per asyncRewake spawn, which is bounded.
-# Decide whether a recorded owner should be considered alive. A live owner
-# is one whose PID is a real, running process AND whose registered FIFO
-# still exists. The FIFO check guards against PID reuse — a recycled PID
-# could otherwise be mistaken for the original owner.
-owner_is_live() {
-    local pid="$1"
-    local fifo="$2"
+###############################################################################
+# Event processing
+###############################################################################
 
-    # Reject empty, non-numeric, and pid <= 1 (init/group). `kill -0 0` would
-    # otherwise succeed because it targets the current process group, which
-    # would be wrong here.
-    case "$pid" in
-        ''|*[!0-9]*) return 1 ;;
-    esac
-    if [ "$pid" -le 1 ]; then
-        return 1
-    fi
-
-    if ! kill -0 "$pid" 2>/dev/null; then
-        return 1
-    fi
-
-    # FIFO must exist (and be a FIFO). If the FIFO is gone, the original
-    # session has cleaned up and the PID has likely been reused.
-    if [ -z "$fifo" ] || [ ! -p "$fifo" ]; then
-        return 1
-    fi
-
-    return 0
-}
-
-adopt_orphans() {
-    [ -d "$PR_OWNERS_DIR" ] || return 0
-
-    local my_repo
-    my_repo=$(git -C "$(pwd)" remote get-url origin 2>/dev/null \
-        | sed 's|.*github.com[:/]||;s|\.git$||' \
-        | tr '/' '-')
-    [ -z "$my_repo" ] && return 0
-
-    local adopted=0
-    for owner in "$PR_OWNERS_DIR"/${my_repo}-*.json; do
-        [ -f "$owner" ] || continue
-
-        local owner_pid owner_fifo owner_repo owner_pr owner_url
-        owner_pid=$(jq -r '.pid // 0' "$owner" 2>/dev/null)
-        owner_fifo=$(jq -r '.fifo // ""' "$owner" 2>/dev/null)
-        owner_repo=$(jq -r '.repo // ""' "$owner" 2>/dev/null)
-        owner_pr=$(jq -r '.pr // 0' "$owner" 2>/dev/null)
-        owner_url=$(jq -r '.url // ""' "$owner" 2>/dev/null)
-
-        # Only process records for our repo (the glob is broad — *-*-*.json)
-        [ "$owner_repo" = "$my_repo" ] || continue
-        [ "$owner_pr" -gt 0 ] || continue
-
-        # Skip live owners
-        if owner_is_live "$owner_pid" "$owner_fifo"; then
-            continue
-        fi
-
-        # Derive owner/repo from the stored URL rather than reconstructing it
-        # from the dashed file prefix. The dashed form is not invertible when
-        # the GitHub owner or repo name itself contains a dash (for example
-        # "my-org/my-repo" → "my-org-my-repo"), so we cannot rely on
-        # "${my_repo/-//}". The URL is the canonical source of truth.
-        local pr_full_repo=""
-        if [[ "$owner_url" =~ github\.com/([^/]+)/([^/]+)/pull/[0-9]+ ]]; then
-            pr_full_repo="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
-        fi
-        if [ -z "$pr_full_repo" ]; then
-            echo "[wake-on-event] Cannot derive owner/repo from $owner.url, skipping" >&2
-            continue
-        fi
-
-        # Verify the PR is still open on GitHub. If gh fails, leave the
-        # record alone — better to keep an orphan than to lose state.
-        # Each call is bounded by 5s; total scan time is per_record × records.
-        local pr_state
-        pr_state=$(timeout 5 gh pr view "$owner_pr" \
-            --repo "$pr_full_repo" \
-            --json state \
-            --jq '.state' 2>/dev/null)
-
-        case "$pr_state" in
-            OPEN)
-                # Adopt with strict first-wins: take an exclusive lock on the
-                # owner file, re-read the record under the lock, only rewrite
-                # if it still points at the same dead PID we observed
-                # (compare-and-swap). A racing session that already adopted
-                # the record would have changed the PID, so we would back off.
-                local lock_file="$owner.lock"
-                (
-                    if flock -x -w 5 9; then
-                        local cur_pid cur_repo cur_pr cur_fifo
-                        cur_pid=$(jq -r '.pid // 0' "$owner" 2>/dev/null)
-                        cur_fifo=$(jq -r '.fifo // ""' "$owner" 2>/dev/null)
-                        cur_repo=$(jq -r '.repo // ""' "$owner" 2>/dev/null)
-                        cur_pr=$(jq -r '.pr // 0' "$owner" 2>/dev/null)
-
-                        # Check the record still matches the same orphan AND is
-                        # still dead. If another session already adopted it,
-                        # cur_pid would now be alive and we back off.
-                        if [ -f "$owner" ] \
-                            && [ "$cur_pid" = "$owner_pid" ] \
-                            && [ "$cur_repo" = "$owner_repo" ] \
-                            && [ "$cur_pr" = "$owner_pr" ] \
-                            && ! owner_is_live "$cur_pid" "$cur_fifo"; then
-                            local tmp="$owner.adopt.$$"
-                            if jq \
-                                --argjson pid "$CLAUDE_PID" \
-                                --arg fifo "$FIFO" \
-                                --arg adopted "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-                                '.pid = $pid | .fifo = $fifo | .adopted_at = $adopted' \
-                                "$owner" > "$tmp" 2>/dev/null; then
-                                mv "$tmp" "$owner"
-                                echo "[wake-on-event] Adopted PR #$owner_pr from dead PID $owner_pid" >&2
-                                exit 0
-                            else
-                                rm -f "$tmp"
-                            fi
-                        fi
-                        exit 1
-                    else
-                        echo "[wake-on-event] Could not acquire lock for $owner, skipping" >&2
-                        exit 2
-                    fi
-                ) 9>"$lock_file"
-                if [ "$?" -eq 0 ]; then
-                    adopted=$((adopted + 1))
-                fi
-                # Best-effort cleanup of the lock file (the lock itself was
-                # already released when the subshell exited).
-                rm -f "$lock_file"
-                ;;
-            MERGED|CLOSED)
-                # PR is no longer interesting — clean up the orphan record
-                rm -f "$owner"
-                echo "[wake-on-event] Cleaned up PR #$owner_pr (state: $pr_state)" >&2
-                ;;
-            *)
-                # gh failed, unknown state, or empty — leave alone
-                ;;
-        esac
-    done
-
-    if [ "$adopted" -gt 0 ]; then
-        echo "[wake-on-event] Adopted $adopted orphaned PR ownership(s) for $my_repo" >&2
-    fi
-}
-adopt_orphans
-
-# Process a single event JSON payload received via FIFO. Outputs human-
-# readable instructions to stderr (Claude Code captures and re-injects them
-# as a system reminder when the script exits with code 2).
+# Render an event JSON payload as human-readable instructions on stderr.
+# Claude Code captures stderr and re-injects it as a system reminder when
+# we exit with code 2.
 process_event() {
     local event_data="$1"
     [ -z "$event_data" ] && return 1
@@ -306,10 +150,27 @@ process_event() {
                 pr_num=$(echo "$event_data" | jq -r '.prNumber // "unknown"')
                 pr_url=$(echo "$event_data" | jq -r '.prUrl // ""')
                 comments=$(echo "$event_data" | jq -r '.reviewComments // 0')
-                echo "Code review on $repo_name PR #$pr_num: $comments comments (status: $status)"
+                echo "Code review COMPLETE on $repo_name PR #$pr_num: $comments comment(s)"
                 [ -n "$pr_url" ] && echo "PR: $pr_url"
-                echo "Read comments: gh api repos/$repo_name/pulls/$pr_num/comments --jq '.[].body'"
-                echo "Fix all issues, push, notify user via mcp__notify__notify."
+                echo ""
+                if [ "$comments" = "0" ]; then
+                    echo "ZERO COMMENTS — execute this single command, no other action allowed before it:"
+                    echo ""
+                    echo "  gh pr merge $pr_num --repo $repo_name --merge --delete-branch"
+                    echo ""
+                    echo "After the merge succeeds, send mcp__notify__notify with the result. Do not report progress before merging. Do not ask the user for permission. Do not switch to other tasks."
+                else
+                    echo "$comments COMMENT(S) — execute this exact sequence in order, no other action allowed in between:"
+                    echo ""
+                    echo "  1. gh api repos/$repo_name/pulls/$pr_num/comments --jq '.[].body'"
+                    echo "  2. Fix every comment in the working tree"
+                    echo "  3. git add -A && git commit -m \"fix: address Copilot review on PR #$pr_num\""
+                    echo "  4. git push"
+                    echo "  5. gh pr merge $pr_num --repo $repo_name --merge --delete-branch"
+                    echo "  6. mcp__notify__notify with the merge result"
+                    echo ""
+                    echo "Steps 1–5 are a single transaction. Do not stop between steps. Do not report progress to the user before step 5 succeeds. Do not ask permission. Do not switch tasks. The fix-and-merge is mandatory and atomic."
+                fi
                 ;;
             ci-complete)
                 local pr_num pr_branch
@@ -347,21 +208,22 @@ process_event() {
     return 0
 }
 
-# Block on the FIFO. The 600s timeout exists only as a safety belt; in
-# practice the Notifier writes events as soon as GitHub triggers them, and
-# this loop returns within seconds.
+###############################################################################
+# Main loop: block on FIFO
+###############################################################################
+
 while true; do
     if EVENT_DATA=$(timeout 600 cat "$FIFO" 2>/dev/null); then
         [ -z "$EVENT_DATA" ] && exit 2
         process_event "$EVENT_DATA"
         exit 2
     fi
-    # Timeout: nothing happened in 10 minutes. Loop and re-block.
-    # Refresh manifest with current cwd (cheap).
+    # Timeout: nothing happened in 10 minutes. Refresh manifest with current
+    # cwd (cheap) and loop back.
     jq -n \
         --argjson pid "$CLAUDE_PID" \
         --arg fifo "$FIFO" \
         --arg cwd "$(pwd)" \
         --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        '{pid: $pid, fifo: $fifo, cwd: $cwd, created: $created}' > "$MANIFEST"
+        '{pid: $pid, fifo: $fifo, cwd: $cwd, created: $created}' > "$MANIFEST" 2>/dev/null
 done

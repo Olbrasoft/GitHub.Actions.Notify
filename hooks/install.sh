@@ -7,10 +7,12 @@
 #   ./hooks/install.sh --check   # report drift without installing
 #
 # What this installs:
-#   - wake-on-event.sh           : asyncRewake hook (per-session FIFO consumer)
-#   - wake-claude.sh             : producer-side FIFO writer with ack semantics
+#   - wake-on-event.sh           : asyncRewake hook (per-session FIFO consumer
+#                                  with orphan suicide and singleton check)
+#   - wake-claude.sh             : producer-side notifier — enumerates running
+#                                  Claude sessions and delivers events to the
+#                                  correct one with bounded retry
 #   - webhook-receiver.py        : HTTP listener for `gh webhook forward` (port 9877)
-#   - check-deploy-status.sh     : UserPromptSubmit fallback reader
 #   - start-webhook-forwards.sh  : systemd service entrypoint (forwards + receiver)
 #
 # Configuration NOT touched by this script (you must do it manually once):
@@ -24,10 +26,9 @@ INSTALL_DIR="$HOME/.claude/hooks"
 HOOKS=(
     wake-on-event.sh
     wake-claude.sh
+    get-session-id.sh
     webhook-receiver.py
     start-webhook-forwards.sh
-    register-pr-owner.sh
-    auto-register-pr-from-tool-output.sh
 )
 
 MODE="install"
@@ -97,29 +98,22 @@ fi
 echo ""
 echo "[install] Summary: $install_count installed, $skip_count skipped"
 
-# Sanity-check Claude Code hook configuration. Two hooks need to be wired:
+# Sanity-check Claude Code hook configuration. Only one hook needs wiring:
 #
-#   1. wake-on-event.sh — asyncRewake on SessionStart and Stop. Provides
-#      the per-session FIFO and the wake mechanism.
-#   2. auto-register-pr-from-tool-output.sh — PostToolUse hook (matcher:
-#      "Bash"). Auto-registers PR ownership when `gh pr create` is run,
-#      so future events for that PR can be routed back to this session.
+#   wake-on-event.sh — asyncRewake on SessionStart and Stop. Provides the
+#   per-session FIFO and the wake mechanism. wake-claude.sh enumerates live
+#   Claude sessions on its own — there is no PR registry or PostToolUse hook.
 #
 # The script does not modify settings.json directly (too risky); instead it
 # reports what is missing and prints a copy-paste-ready snippet.
 SETTINGS="$HOME/.claude/settings.json"
 if [ -f "$SETTINGS" ]; then
-    missing=()
-    grep -q "wake-on-event.sh" "$SETTINGS" || missing+=("wake-on-event.sh")
-    grep -q "auto-register-pr-from-tool-output.sh" "$SETTINGS" || missing+=("auto-register-pr-from-tool-output.sh")
-
-    if [ "${#missing[@]}" -eq 0 ]; then
-        echo "[install] OK: wake-on-event.sh and auto-register-pr-from-tool-output.sh are both referenced in $SETTINGS"
+    if grep -q "wake-on-event.sh" "$SETTINGS"; then
+        echo "[install] OK: wake-on-event.sh is referenced in $SETTINGS"
     else
         cat <<EOF >&2
 
-WARNING: $SETTINGS is missing one or more hook references:
-${missing[*]}
+WARNING: $SETTINGS does not reference wake-on-event.sh.
 
 Add the following fragments to the "hooks" section (merge with any
 existing entries):
@@ -143,17 +137,6 @@ existing entries):
             "type": "command",
             "command": "$INSTALL_DIR/wake-on-event.sh",
             "asyncRewake": true
-          }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "$INSTALL_DIR/auto-register-pr-from-tool-output.sh"
           }
         ]
       }
