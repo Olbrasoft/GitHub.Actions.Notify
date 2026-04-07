@@ -198,6 +198,9 @@ process_event() {
                     echo "  gh api repos/$repo_name/pulls/$pr_num/comments --jq '.[].body'"
                     echo "Address relevant ones in the working tree, commit (\"fix: address Copilot review on PR #$pr_num\"), push, then merge:"
                     echo "  gh pr merge $pr_num --repo $repo_name --merge --delete-branch"
+                    echo ""
+                    echo "IMPORTANT: Copilot reviews each PR ONCE. After pushing the fix commits, MERGE THE PR DIRECTLY — do NOT wait for a second review wake event. It will never arrive. Source: engineering-handbook/.../continuous-pr-processing-workflow.md and ci-workflow-monitor SKILL.md Critical Rule #7."
+                    echo ""
                     echo "If state=MERGED: comments may already be addressed by later commits in main — verify against current code before doing anything."
                     echo "If state=CLOSED (not merged): skip — the work was abandoned."
                 fi
@@ -209,7 +212,12 @@ process_event() {
                 pr_branch=$(echo "$event_data" | jq -r '.branch // "unknown"')
                 echo "CI $status for $repo_name PR #$pr_num (branch: $pr_branch)"
                 if [ "$status" = "success" ]; then
-                    echo "All CI checks passed. Check if Copilot review is done, then merge PR."
+                    echo "All CI checks passed. Decide based on Copilot review state:"
+                    echo "  gh pr view $pr_num --repo $repo_name --json reviews --jq '.reviews | length'"
+                    echo "  - 0 reviews → Copilot has not reviewed yet. Wait briefly for code-review-complete wake event (max ~5 minutes)."
+                    echo "  - >=1 reviews and you have ALREADY addressed all comments → MERGE NOW. Copilot reviews each PR exactly once and will not fire again on push."
+                    echo "  - >=1 reviews with unresolved comments → fix them first (per the code-review-complete advisory you got earlier), then merge."
+                    echo "Do NOT wait passively for a second review wake event after pushing fixes — it will never arrive."
                 else
                     echo "CI FAILED. Read logs: gh run list --repo $repo_name --branch $pr_branch --limit 1"
                     echo "Fix the issue, push. Notify user via mcp__notify__notify."

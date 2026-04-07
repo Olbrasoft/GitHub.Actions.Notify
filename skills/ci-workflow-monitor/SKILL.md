@@ -15,6 +15,7 @@ Fully autonomous issue-to-production pipeline. Given an issue (or parent issue w
 4. **Pipeline processing** — never wait for review, continue with next issue
 5. **Close issues** only after production verification confirms changes are visible
 6. **NEVER say "issue done" after creating a PR** — issue is done ONLY after deploy + Playwright production verification confirms the changes are visible and working. Creating a PR is ~20% of the work.
+7. **Copilot reviews each PR ONCE** — there is no automatic re-review after a push. After addressing review comments and pushing the fix commits, MERGE THE PR DIRECTLY. Do NOT wait passively for a second wake event from Copilot — it will never arrive. Source of truth: `engineering-handbook/development-guidelines/workflow/continuous-pr-processing-workflow.md` ("no re-review after fixes"). If you ever genuinely want a fresh Copilot pass after pushing fixes, you must explicitly re-request the review via `gh api repos/<OWNER>/<REPO>/pulls/<N>/requested_reviewers -X POST -f reviewers='["Copilot"]'`. Default flow does NOT do this — it just merges.
 
 ## When Is an Issue "Done"?
 
@@ -45,7 +46,12 @@ An issue is complete ONLY when ALL of these are true:
 Issue assigned
   └── Implement → commit → push → create PR
         ├── WAIT for code review push notification (asyncRewake hook)
-        │     ├── review has comments → fix → push → wait for next review push
+        │     ├── review has comments → fix → push → MERGE
+        │     │     (Copilot reviews each PR ONCE — no re-review fires
+        │     │      automatically on push. Do NOT wait passively after
+        │     │      pushing fixes; merge directly. See engineering-
+        │     │      handbook/.../continuous-pr-processing-workflow.md
+        │     │      "no re-review after fixes".)
         │     └── review clean → MERGE
         ├── WAIT for deploy push notification (asyncRewake hook)
         │     ├── deploy failed → notify error
@@ -207,7 +213,7 @@ When `deploy-complete` has `status: failure`, the `failedStep` field tells you w
 | CI_PENDING | — | Silent wait (CI runs on GitHub cloud) |
 | CI_FAILED | — | Analyze logs → fix → push |
 | CI_PASSED | — | Wait for review push notification |
-| REVIEW_COMPLETE | push (asyncRewake) | Read comments, fix if any → merge |
+| REVIEW_COMPLETE | push (asyncRewake) | Read comments, fix if any → push fixes → MERGE (no re-review will fire — Copilot reviews each PR exactly once, see Critical Rule #7) |
 | PR_MERGED | — | Wait for deploy push notification |
 | DEPLOY_COMPLETE | push (asyncRewake) | Verify production (health + Playwright) |
 | DEPLOY_FAILED | push (asyncRewake) | Notify error |
