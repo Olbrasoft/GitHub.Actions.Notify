@@ -20,25 +20,26 @@ Copilot reviews PR → gh webhook forward → webhook-receiver.py → FIFO wakes
 
 Each Claude Code session creates a FIFO pipe at `/tmp/claude-wake/{REPO}/{PID}.fifo`. External processes write event data through the FIFO to wake the session. Zero CPU while waiting.
 
-## Prerequisites (Global — Already Installed)
+## Prerequisites — Install Hooks On This Machine
 
-These are already set up globally. **Do NOT reinstall.** Just verify they exist:
+The hook scripts (FIFO consumer, wake script, webhook receiver, fallback reader) live in this repo under `hooks/` and are installed into `~/.claude/hooks/` by the install script. **Run this once per developer machine** (not per project):
 
 ```bash
-# Verify global hooks exist and are executable
-ls -la ~/.claude/hooks/wake-on-event.sh    # FIFO-based asyncRewake hook
-ls -la ~/.claude/hooks/wake-claude.sh       # Wake script (finds matching FIFOs)
-ls -la ~/.claude/hooks/webhook-receiver.py  # Webhook receiver (port 9877)
-ls -la ~/.claude/hooks/check-deploy-status.sh  # Fallback reader
+cd ~/Olbrasoft/GitHub.Actions.Notify  # or wherever you cloned this repo
+./hooks/install.sh
+```
 
-# Verify hooks are configured in settings.json
-grep -c "wake-on-event.sh" ~/.claude/settings.json  # Should be 2 (SessionStart + Stop)
+Verify the install:
 
-# Verify webhook forward service is running
+```bash
+# Drift check — should report no diff between repo and ~/.claude/hooks/
+./hooks/install.sh --check
+
+# Verify webhook forward service is running (one-time systemd setup)
 systemctl --user status gh-webhook-forward.service
 ```
 
-If any of these are missing, something is wrong with the global setup. Do NOT proceed — investigate first.
+If `gh-webhook-forward.service` does not exist, see `docs/integration-guide.md` for the systemd unit setup. If `~/.claude/settings.json` does not register `wake-on-event.sh` as an asyncRewake hook, the install script will print the snippet you need to add.
 
 ## Setup Steps (Per-Project)
 
@@ -108,6 +109,7 @@ Read the existing `.github/workflows/ci.yml` (or deploy workflow). The deploy jo
         EVENTS_DIR="$HOME/.config/claude-channels/deploy-events"
         mkdir -p "$EVENTS_DIR"
         REPO_FILE="${GITHUB_REPOSITORY//\//-}"
+        COMMIT_SHA="${GITHUB_SHA:0:7}"
 
         # Detect which step failed — customize these step IDs for this project!
         FAILED_STEP=""
@@ -122,15 +124,20 @@ Read the existing `.github/workflows/ci.yml` (or deploy workflow). The deploy jo
             --arg status "${{ job.status }}" \
             --arg failedStep "$FAILED_STEP" \
             --arg repository "${{ github.repository }}" \
-            --arg commit "${GITHUB_SHA:0:7}" \
+            --arg commit "$COMMIT_SHA" \
             --arg commitMessage "$(git log -1 --pretty=%s 2>/dev/null || echo unknown)" \
             --arg runUrl "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
             --arg environment "production" \
             --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             '{event: $event, status: $status, failedStep: $failedStep, repository: $repository, commit: $commit, commitMessage: $commitMessage, runUrl: $runUrl, environment: $environment, timestamp: $timestamp}' \
-            > "$EVENTS_DIR/${REPO_FILE}.json"
+            > "$EVENTS_DIR/${REPO_FILE}-deploy-${COMMIT_SHA}.json"
 
-          # Wake ALL Claude Code sessions for this repo via FIFO
+          # Wake ALL Claude Code sessions for this repo via FIFO. wake-claude.sh
+          # uses ack semantics: it deletes the event file ONLY after a live
+          # consumer has positively read it. If no session is alive at this
+          # moment, the file persists and will be picked up by
+          # check-deploy-status.sh on the next UserPromptSubmit. Two concurrent
+          # deploys cannot collide because the filename includes the commit SHA.
           WAKE_SCRIPT="$HOME/.claude/hooks/wake-claude.sh"
           if [ -x "$WAKE_SCRIPT" ]; then
             "$WAKE_SCRIPT" "${GITHUB_REPOSITORY}" || true
@@ -172,17 +179,18 @@ Read the existing `.github/workflows/ci.yml` (or deploy workflow). The deploy jo
           EVENTS_DIR="$HOME/.config/claude-channels/deploy-events"
           mkdir -p "$EVENTS_DIR"
           REPO_FILE="${GITHUB_REPOSITORY//\//-}"
+          COMMIT_SHA="${GITHUB_SHA:0:7}"
 
           if command -v jq >/dev/null 2>&1; then
             jq -n \
               --arg event "verify-complete" \
               --arg status "${{ job.status }}" \
               --arg repository "${{ github.repository }}" \
-              --arg commit "${GITHUB_SHA:0:7}" \
+              --arg commit "$COMMIT_SHA" \
               --arg environment "production" \
               --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
               '{event: $event, status: $status, repository: $repository, commit: $commit, environment: $environment, timestamp: $timestamp}' \
-              > "$EVENTS_DIR/${REPO_FILE}-verify.json"
+              > "$EVENTS_DIR/${REPO_FILE}-verify-${COMMIT_SHA}.json"
 
             WAKE_SCRIPT="$HOME/.claude/hooks/wake-claude.sh"
             if [ -x "$WAKE_SCRIPT" ]; then
