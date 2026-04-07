@@ -97,6 +97,94 @@ jq -n \
     --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     '{pid: $pid, fifo: $fifo, cwd: $cwd, created: $created}' > "$MANIFEST"
 
+# Adopt orphaned PR ownerships from previous (now-dead) sessions for this
+# repo. The use case: user creates PRs in a Claude session, closes it, opens
+# a new one in the same project — they expect the new session to receive
+# pending events for those PRs and continue the workflow autonomously.
+#
+# Adoption rules:
+#   1. Only owner records for the cwd's git repo are considered (so a
+#      session in repo A does not adopt PRs from repo B).
+#   2. Only records whose pid is dead (kill -0 fails) are adopted —
+#      a live owner is left alone.
+#   3. The PR must still be OPEN on GitHub. Closed/merged PRs are not
+#      relevant; their owner records are deleted.
+#   4. Adoption is silent (no events are delivered as a side effect).
+#      The next event from GitHub will be routed to the new owner via
+#      wake-claude.sh as usual.
+#
+# This is a best-effort scan: if `gh` is missing or the API is slow, we
+# skip the PR-state check rather than blocking session startup. The
+# scan runs at most once per asyncRewake spawn, which is bounded.
+adopt_orphans() {
+    [ -d "$PR_OWNERS_DIR" ] || return 0
+
+    local my_repo
+    my_repo=$(git -C "$(pwd)" remote get-url origin 2>/dev/null \
+        | sed 's|.*github.com[:/]||;s|\.git$||' \
+        | tr '/' '-')
+    [ -z "$my_repo" ] && return 0
+
+    local adopted=0
+    for owner in "$PR_OWNERS_DIR"/${my_repo}-*.json; do
+        [ -f "$owner" ] || continue
+
+        local owner_pid owner_repo owner_pr
+        owner_pid=$(jq -r '.pid // 0' "$owner" 2>/dev/null)
+        owner_repo=$(jq -r '.repo // ""' "$owner" 2>/dev/null)
+        owner_pr=$(jq -r '.pr // 0' "$owner" 2>/dev/null)
+
+        # Only process records for our repo (the glob is broad — *-*-*.json)
+        [ "$owner_repo" = "$my_repo" ] || continue
+        [ "$owner_pr" -gt 0 ] || continue
+
+        # Skip live owners
+        if kill -0 "$owner_pid" 2>/dev/null; then
+            continue
+        fi
+
+        # Verify the PR is still open on GitHub. If gh fails, leave the
+        # record alone — better to keep an orphan than to lose state.
+        local pr_state
+        pr_state=$(timeout 5 gh pr view "$owner_pr" \
+            --repo "${my_repo/-//}" \
+            --json state \
+            --jq '.state' 2>/dev/null)
+
+        case "$pr_state" in
+            OPEN)
+                # Adopt: replace pid + fifo, add adopted_at marker
+                local tmp="$owner.adopt.$$"
+                if jq \
+                    --argjson pid "$CLAUDE_PID" \
+                    --arg fifo "$FIFO" \
+                    --arg adopted "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                    '.pid = $pid | .fifo = $fifo | .adopted_at = $adopted' \
+                    "$owner" > "$tmp" 2>/dev/null; then
+                    mv "$tmp" "$owner"
+                    adopted=$((adopted + 1))
+                    echo "[wake-on-event] Adopted PR #$owner_pr from dead PID $owner_pid" >&2
+                else
+                    rm -f "$tmp"
+                fi
+                ;;
+            MERGED|CLOSED)
+                # PR is no longer interesting — clean up the orphan record
+                rm -f "$owner"
+                echo "[wake-on-event] Cleaned up PR #$owner_pr (state: $pr_state)" >&2
+                ;;
+            *)
+                # gh failed, unknown state, or empty — leave alone
+                ;;
+        esac
+    done
+
+    if [ "$adopted" -gt 0 ]; then
+        echo "[wake-on-event] Adopted $adopted orphaned PR ownership(s) for $my_repo" >&2
+    fi
+}
+adopt_orphans
+
 # Process a single event JSON payload received via FIFO. Outputs human-
 # readable instructions to stderr (Claude Code captures and re-injects them
 # as a system reminder when the script exits with code 2).

@@ -242,12 +242,46 @@ T+31s The assistant verifies the deployment, runs Playwright on the changed
 
 Total latency from "deploy completes" to "assistant reacts": **~1 second**.
 
-## End-to-end sad path (owner dead)
+## Owner adoption on session start
+
+When the user closes Claude Code and reopens it in the same project, the new session adopts orphaned owner records that point at the now-dead previous PID. This is a one-shot scan run by `wake-on-event.sh` on every spawn:
 
 ```
-T+0   Developer's Claude session 13008 created PR #925 yesterday, then closed.
-T+0   Owner record still on disk: pr-owners/Olbrasoft-VirtualAssistant-925.json
-      pointing at the now-dead PID 13008.
+For each pr-owners/{my_repo}-*.json:
+    if owner.pid is alive  → leave alone (live session, exact-once preserved)
+    if owner.pid is dead AND PR is OPEN on GitHub:
+        rewrite owner record: pid = my_pid, fifo = my_fifo, adopted_at = now
+    if owner.pid is dead AND PR is MERGED/CLOSED:
+        delete owner record (no longer interesting)
+    if gh API fails (timeout, network error):
+        leave alone (better orphan than lost state)
+```
+
+Adoption is restricted to the cwd's git repo (so a session in repo A does not adopt PRs from repo B), and runs in under 5 seconds bounded by `timeout 5 gh pr view`. Multi-terminal in the same project: whichever session adopts first wins; subsequent sessions see the record as live and skip it. No double delivery.
+
+This closes the gap for users who close and reopen Claude Code mid-workflow:
+
+```
+T+0   Session A (PID 100) creates PR #925 → owner: pid=100
+T+5m  User closes Claude Code → PID 100 dies
+T+5m  Owner record still on disk pointing at 100
+T+10m User opens new Claude Code, PID 200, in the same project
+T+10m wake-on-event.sh starts:
+        - Creates new FIFO /tmp/claude-wake/.session-200.fifo
+        - Scans pr-owners/Olbrasoft-VirtualAssistant-*.json
+        - Finds PR #925: pid=100 (DEAD), state=OPEN
+        - Adopts: rewrites record to pid=200, fifo=.session-200.fifo
+T+15m GitHub Copilot finishes review → wake-claude.sh
+T+15m Notifier looks up owner #925 → pid=200 (alive) → delivers via FIFO
+T+15m Session B is woken with the review event → continues the workflow
+```
+
+## End-to-end sad path (owner truly gone, no successor)
+
+```
+T+0   Developer's Claude session 13008 created PR #925, then closed.
+      Did NOT reopen Claude Code in that project afterwards.
+T+1d  Owner record still on disk pointing at the now-dead PID 13008.
 T+1d  GitHub fires deploy → event file written → wake-claude.sh called
 T+1d  wake-claude.sh:
         - Reads the event
@@ -260,4 +294,4 @@ T+1d  wake-claude.sh:
 T+1d  Nothing happens. No retry. No future delivery.
 ```
 
-The user explicitly accepts this outcome: when they next open Claude Code in any project, they will start with a fresh task and not be confused by stale notifications.
+The user explicitly accepts this outcome: when they truly never come back to that project, stale events would only confuse them on a future fresh task. Adoption only fires when there IS a session in the same project.
