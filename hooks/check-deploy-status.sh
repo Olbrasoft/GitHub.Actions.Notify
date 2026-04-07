@@ -110,3 +110,53 @@ for event_file in "$EVENTS_DIR"/${REPO_PREFIX}*.json; do
       ;;
   esac
 done
+
+###############################################################################
+# Surface recent wake feedback log entries (issue #40)
+###############################################################################
+#
+# Show the most recent N entries from ~/.config/claude-channels/wake-feedback.md
+# so the current session has context about prior wake mechanism quirks observed
+# by other sessions. Bounded by entry count to avoid blowing up Claude's
+# context window with months of history.
+WAKE_FEEDBACK_LOG="$HOME/.config/claude-channels/wake-feedback.md"
+WAKE_FEEDBACK_MAX_ENTRIES="${WAKE_FEEDBACK_MAX_ENTRIES:-5}"
+
+if [ -f "$WAKE_FEEDBACK_LOG" ]; then
+    # Each entry is a level-2 markdown header `## <timestamp> — <event>`
+    # followed by bullets and a `---` separator. We grab the last N
+    # entries by accumulating into an array and printing the tail.
+    # Ring buffer: keep at most `max` entries in memory at any time so
+    # runtime stays bounded even if the log grows to thousands of entries.
+    recent_entries=$(awk -v max="$WAKE_FEEDBACK_MAX_ENTRIES" '
+        BEGIN { count = 0; entry = ""; in_entry = 0 }
+        /^## / { in_entry = 1; entry = "" }
+        in_entry { entry = entry $0 "\n" }
+        /^---$/ && in_entry {
+            slot = (count % max) + 1
+            entries[slot] = entry
+            count++
+            entry = ""
+            in_entry = 0
+        }
+        END {
+            total = (count < max) ? count : max
+            # Oldest still-buffered slot is just past the most recent.
+            start = (count > max) ? ((count % max) + 1) : 1
+            for (i = 0; i < total; i++) {
+                slot = ((start - 1 + i) % max) + 1
+                printf "%s", entries[slot]
+            }
+        }
+    ' "$WAKE_FEEDBACK_LOG")
+
+    if [ -n "$recent_entries" ]; then
+        echo "<wake-feedback-log path=\"$WAKE_FEEDBACK_LOG\" recent=\"$WAKE_FEEDBACK_MAX_ENTRIES\">"
+        echo "Recent wake mechanism feedback entries from this and other Claude sessions."
+        echo "Read these to spot patterns (late deliveries, stale events, garbled JSON, ...)."
+        echo "If something here is relevant to current work, mention it. Otherwise treat as background context."
+        echo ""
+        echo "$recent_entries"
+        echo "</wake-feedback-log>"
+    fi
+fi

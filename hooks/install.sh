@@ -17,6 +17,14 @@
 #                                  prompt. Last line of defense if FIFO push
 #                                  wake missed the event (or wake-claude.sh
 #                                  exhausted retries and DEFERred the file).
+#                                  Also surfaces recent wake-feedback log
+#                                  entries so the session inherits cross-
+#                                  session observations.
+#   - log-wake-feedback.sh       : helper Claude calls after each wake event
+#                                  to record a structured evaluation
+#                                  (ok/late/stale/garbled/...) into the
+#                                  shared markdown log at
+#                                  ~/.config/claude-channels/wake-feedback.md
 #   - webhook-receiver.py        : HTTP listener for `gh webhook forward` (port 9877)
 #   - start-webhook-forwards.sh  : systemd service entrypoint (forwards + receiver)
 #
@@ -32,6 +40,7 @@ HOOKS=(
     wake-on-event.sh
     wake-claude.sh
     check-deploy-status.sh
+    log-wake-feedback.sh
     get-session-id.sh
     webhook-receiver.py
     start-webhook-forwards.sh
