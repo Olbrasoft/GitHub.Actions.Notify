@@ -7,10 +7,10 @@
 #   - webhook-receiver.py (for pull_request_review and check_suite events)
 #
 # Usage:
-#   wake-claude.sh <REPO> [<BRANCH>]
+#   wake-claude.sh <REPO>
 #
-#     REPO:   "Olbrasoft/cr" or "Olbrasoft-cr" (auto-converted)
-#     BRANCH: optional hint for narrowing session selection
+#     REPO: "Olbrasoft/cr" (preferred) or "Olbrasoft-cr" (legacy single-dash
+#           form; ambiguous with 2+ dashes — use slash form instead)
 #
 # Algorithm — ONE TRANSACTION, no daemons, no registry, no inbox:
 #
@@ -40,18 +40,23 @@
 set -u
 
 REPO_RAW="${1:-}"
-BRANCH_HINT="${2:-}"
 
-[ -z "$REPO_RAW" ] && { echo "[wake-claude] usage: $0 <REPO> [<BRANCH>]" >&2; exit 1; }
+[ -z "$REPO_RAW" ] && { echo "[wake-claude] usage: $0 <REPO>" >&2; exit 1; }
 
 # Normalize repo: "Olbrasoft/cr" → "Olbrasoft-cr" (file form),
 #                 keep slash form for gh api calls.
 REPO_FILE=$(echo "$REPO_RAW" | tr '/' '-')
 if [[ "$REPO_RAW" == */* ]]; then
     REPO_FULL="$REPO_RAW"
+elif [[ "$REPO_RAW" == *-* && "$REPO_RAW" != *-*-* ]]; then
+    # Legacy dashed form is only safe when there is exactly one dash
+    # (single-dash owner/repo). Replace the only dash with a slash.
+    REPO_FULL="${REPO_RAW/-//}"
 else
-    # Convert dashed back to slash form for gh api: assume first dash = owner/repo split
-    REPO_FULL=$(echo "$REPO_RAW" | sed 's/-/\//')
+    # Multiple dashes are ambiguous (could be "my-org/repo", "org/my-repo",
+    # or "my-org/my-repo") — refuse to guess.
+    echo "[wake-claude] ambiguous repo '$REPO_RAW': use owner/repo form for repositories with multiple dashes" >&2
+    exit 1
 fi
 
 EVENTS_DIR="$HOME/.config/claude-channels/deploy-events"
@@ -145,9 +150,62 @@ is_live_claude() {
     return 0
 }
 
-# Kill any orphan FIFO readers for a given target FIFO.
-# Orphans are wake-on-event.sh processes whose grandparent is NOT a claude process
-# (i.e. they were reparented to systemd-user after their original session died).
+# Recursively collect all descendants of a given PID into the variable
+# named by $1. Sets the variable to a newline-separated list (excludes the
+# starting PID).
+collect_descendants() {
+    local result_var="$1"
+    local root_pid="$2"
+    local stack="$root_pid"
+    local result=""
+    while [ -n "$stack" ]; do
+        local current="${stack%%$'\n'*}"
+        if [ "$stack" = "$current" ]; then
+            stack=""
+        else
+            stack="${stack#*$'\n'}"
+        fi
+        local child
+        for child in $(pgrep -P "$current" 2>/dev/null); do
+            result="$result$child"$'\n'
+            stack="$stack$child"$'\n'
+        done
+    done
+    eval "$result_var=\$result"
+}
+
+# Check whether the given PID is a `cat` process whose argv contains the
+# given FIFO path as a literal (fixed-string match — no regex).
+proc_is_cat_of_fifo() {
+    local pid="$1"
+    local fifo="$2"
+    local comm
+    comm=$(cat "/proc/$pid/comm" 2>/dev/null) || return 1
+    [ "$comm" = "cat" ] || return 1
+    # /proc/<pid>/cmdline is NUL-separated argv. Read it and check whether
+    # any argument equals the FIFO path exactly.
+    local cmdline
+    cmdline=$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null) || return 1
+    while IFS= read -r arg; do
+        [ "$arg" = "$fifo" ] && return 0
+    done <<< "$cmdline"
+    return 1
+}
+
+# Kill orphan FIFO readers for a given target FIFO.
+#
+# An orphan reader is a wake-on-event.sh process whose process tree does NOT
+# walk up to a live `claude` ancestor (its original session died and it was
+# reparented). This function:
+#   1. Enumerates wake-on-event.sh processes
+#   2. For each, checks the parent chain for a `claude` ancestor
+#   3. If no `claude` ancestor → walks the orphan's descendant tree to find
+#      its `cat $fifo` reader (which is typically a grandchild of the script:
+#      script → bash subshell → timeout → cat). Uses fixed-string matching
+#      against /proc/<pid>/cmdline argv to avoid regex pitfalls with `.`
+#      in the FIFO path.
+#   4. If the orphan has a cat reading our specific FIFO → kill the entire
+#      descendant tree of the orphan, then the orphan itself
 kill_orphan_readers_for_fifo() {
     local fifo="$1"
     local killed=0
@@ -168,18 +226,37 @@ kill_orphan_readers_for_fifo() {
             depth=$((depth + 1))
         done
 
-        if [ "$found_claude" = "0" ]; then
-            # Verify this orphan is reading our target FIFO before killing.
-            # Children of the orphan include `timeout 600 cat $fifo`.
-            local cmdlines
-            cmdlines=$(pgrep -af "cat $fifo" 2>/dev/null)
-            if echo "$cmdlines" | grep -q "$fifo"; then
-                log "Killing orphan reader PID $pid (FIFO $fifo)"
-                pkill -9 -P "$pid" 2>/dev/null
-                kill -9 "$pid" 2>/dev/null
-                killed=$((killed + 1))
+        [ "$found_claude" = "1" ] && continue
+
+        # Walk the orphan's full descendant tree and look for a `cat`
+        # process whose argv contains our target FIFO as a literal.
+        local orphan_descendants=""
+        collect_descendants orphan_descendants "$pid"
+        local orphan_owns_fifo=0
+        local desc
+        while IFS= read -r desc; do
+            [ -z "$desc" ] && continue
+            if proc_is_cat_of_fifo "$desc" "$fifo"; then
+                orphan_owns_fifo=1
+                break
             fi
-        fi
+        done <<< "$orphan_descendants"
+
+        [ "$orphan_owns_fifo" = "0" ] && continue
+
+        # Kill the entire descendant tree of the orphan, then the orphan
+        # itself. We re-collect descendants because the tree may have
+        # changed since the previous walk.
+        log "Killing orphan reader PID $pid (FIFO $fifo)"
+        local kill_targets=""
+        collect_descendants kill_targets "$pid"
+        local target
+        while IFS= read -r target; do
+            [ -z "$target" ] && continue
+            kill -9 "$target" 2>/dev/null
+        done <<< "$kill_targets"
+        kill -9 "$pid" 2>/dev/null
+        killed=$((killed + 1))
     done
     [ "$killed" -gt 0 ] && log "Killed $killed orphan reader(s) for $fifo"
 }

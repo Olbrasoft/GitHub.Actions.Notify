@@ -27,7 +27,7 @@ Wake happens within seconds of the GitHub event, while the session is still aliv
 | # | Requirement |
 |---|---|
 | R1 | Delivery is **one transaction**: GitHub triggers → wake-claude.sh runs → either delivers to a live session or drops the event. Nothing in between. |
-| R2 | **No background daemons**, no polling loops, no inbox queues drained later. The asyncRewake hook (which Claude Code spawns itself on Stop and SessionStart events) is the only consumer. |
+| R2 | **No background daemons**, no inbox queues drained later. The asyncRewake hook (which Claude Code spawns itself on Stop and SessionStart events) is the only consumer. wake-claude.sh's bounded retry loop (R5) is in-process and tied to the single delivery transaction — there is no out-of-band poller. |
 | R3 | **No PR registry**, no PostToolUse auto-registration, no per-PR ownership state. wake-claude.sh enumerates running Claude sessions on its own at delivery time. |
 | R4 | **Strict matching**: deliver only when exactly one running Claude session is on the matching repository. If 0 or 2+ matches, drop (refuse to guess). |
 | R5 | If the consumer FIFO has no reader at the moment of write (the Claude session is actively running tools and the asyncRewake hook is in the gap between exit-2 and respawn), retry the write for up to 60 seconds, re-checking session liveness on each iteration. After 60s, drop. |
@@ -128,7 +128,11 @@ Wake happens within seconds of the GitHub event, while the session is still aliv
      - 0 matches OR 2+ matches → DROP (ambiguous, refuse to guess)
 5. If target_pid is not a live Claude → DROP
 6. Find FIFO at /tmp/claude-wake/.session-{target_pid}.fifo
-7. Kill any orphan readers on that FIFO (PPID = systemd-user)
+7. Kill any orphan readers on that FIFO (wake-on-event.sh processes
+   whose process tree has no `claude` ancestor — they were reparented
+   after their original session died). Detection walks the orphan's
+   own descendant tree to confirm it actually owns a `cat` reading
+   our FIFO before killing.
 8. Bounded retry write loop (default 300s, configurable via
    WAKE_CLAUDE_RETRY_SECS):
      for each iteration:
@@ -184,14 +188,16 @@ the most recently modified `.jsonl` basename.
 
 A wake-on-event.sh hook process becomes "orphan" when:
 - Its original Claude session died (the user closed Claude Code)
-- The hook process was reparented to systemd-user (PID 1235 on Linux)
+- The hook process is no longer in any live `claude` ancestor's process tree
+  (typically reparented to systemd-user, but the exact reaper PID is not
+  load-bearing — what matters is the absence of a `claude` ancestor)
 - It is still alive, blocked on `cat $FIFO`, and would steal future events
 
 Two layers of defense:
 
 1. **Suicide on startup** (`wake-on-event.sh`): walks the parent process tree, and if no Claude ancestor exists, exits immediately. New hooks never become orphans.
 
-2. **Pre-write kill** (`wake-claude.sh`): before writing to a target FIFO, scans all wake-on-event.sh processes whose chain to a Claude process is broken AND that are reading the target FIFO, and kills them. This handles legacy orphans that pre-existed the suicide check.
+2. **Pre-write kill** (`wake-claude.sh`): before writing to a target FIFO, scans all wake-on-event.sh processes whose process tree has no `claude` ancestor. For each such orphan, walks its descendant tree (script → bash subshell → timeout → cat) looking for a `cat` whose argv literally contains the target FIFO path (fixed-string match against `/proc/<pid>/cmdline`, no regex). If found, kills the entire descendant tree of the orphan, then the orphan itself. This handles legacy orphans that pre-existed the suicide check.
 
 ## Components
 
