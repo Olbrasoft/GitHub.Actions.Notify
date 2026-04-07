@@ -126,19 +126,27 @@ if [ -f "$WAKE_FEEDBACK_LOG" ]; then
     # Each entry is a level-2 markdown header `## <timestamp> — <event>`
     # followed by bullets and a `---` separator. We grab the last N
     # entries by accumulating into an array and printing the tail.
+    # Ring buffer: keep at most `max` entries in memory at any time so
+    # runtime stays bounded even if the log grows to thousands of entries.
     recent_entries=$(awk -v max="$WAKE_FEEDBACK_MAX_ENTRIES" '
-        BEGIN { count = 0; entry = "" }
-        /^## / { in_entry = 1 }
+        BEGIN { count = 0; entry = ""; in_entry = 0 }
+        /^## / { in_entry = 1; entry = "" }
         in_entry { entry = entry $0 "\n" }
         /^---$/ && in_entry {
-            entries[++count] = entry
+            slot = (count % max) + 1
+            entries[slot] = entry
+            count++
             entry = ""
             in_entry = 0
         }
         END {
-            start = count - max + 1
-            if (start < 1) start = 1
-            for (i = start; i <= count; i++) printf "%s", entries[i]
+            total = (count < max) ? count : max
+            # Oldest still-buffered slot is just past the most recent.
+            start = (count > max) ? ((count % max) + 1) : 1
+            for (i = 0; i < total; i++) {
+                slot = ((start - 1 + i) % max) + 1
+                printf "%s", entries[slot]
+            }
         }
     ' "$WAKE_FEEDBACK_LOG")
 

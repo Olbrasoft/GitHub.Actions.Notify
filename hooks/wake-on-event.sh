@@ -132,6 +132,10 @@ process_event() {
     # Compute age of the event (now - timestamp). This lets the feedback
     # log entry record observed delay so cross-session pattern analysis
     # can spot late deliveries. Issue #40.
+    #
+    # Guard against negative ages from clock skew or a bad payload — a
+    # negative number would render as `-5s` and confuse Claude. Treat
+    # any negative age as a clamped 0 with an explicit label.
     event_age_seconds=""
     event_age_human=""
     if [ -n "$event_ts" ]; then
@@ -140,7 +144,11 @@ process_event() {
         now_epoch=$(date -u +%s)
         if [ -n "$ts_epoch" ]; then
             event_age_seconds=$((now_epoch - ts_epoch))
-            if [ "$event_age_seconds" -lt 60 ]; then
+            if [ "$event_age_seconds" -lt 0 ]; then
+                # Future timestamp — clock skew. Clamp to 0 and label.
+                event_age_seconds=0
+                event_age_human="0s (clock skew: event_ts in future)"
+            elif [ "$event_age_seconds" -lt 60 ]; then
                 event_age_human="${event_age_seconds}s"
             elif [ "$event_age_seconds" -lt 3600 ]; then
                 event_age_human="$((event_age_seconds / 60))m"

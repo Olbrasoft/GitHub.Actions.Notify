@@ -82,6 +82,20 @@ fi
 
 timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
+# Normalize free-form fields to single line. Newlines, carriage returns
+# and lines that look like markdown structure (`## ` headers, `---`
+# separators) would corrupt the log format and break the awk extractor
+# in check-deploy-status.sh. Collapse newlines/CRs to spaces and escape
+# leading `## ` or `---` patterns into harmless equivalents.
+sanitize_oneline() {
+    # tr removes \n and \r, sed escapes leading markdown markers.
+    printf '%s' "$1" | tr '\n\r' '  ' | sed 's/^## /\\#\\# /; s/^---/\\-\\-\\-/'
+}
+note=$(sanitize_oneline "$note")
+delay=$(sanitize_oneline "$delay")
+commit=$(sanitize_oneline "$commit")
+pr=$(sanitize_oneline "$pr")
+
 # Build entry first into a tmp string, then append under flock so two
 # concurrent appends never interleave. flock on the log file itself
 # (non-blocking would risk losing entries; blocking with a short timeout
@@ -98,9 +112,23 @@ ${delay:+- **delay**: $delay
 MARKDOWN
 )
 
-# Auto-create the file with a header on first use.
-if [ ! -e "$LOG_FILE" ]; then
-    cat > "$LOG_FILE" <<'HEADER'
+# Lock-protected init + append. The auto-create branch must run inside
+# the same exclusive flock as the append, otherwise two concurrent
+# invocations can both observe the file as missing and the second
+# `cat > "$LOG_FILE"` truncates whatever the first one wrote. Use the
+# directory as the lock target so the lock exists even before the file
+# does (and we never accidentally truncate the lock file itself).
+LOCK_FILE="$LOG_DIR/.wake-feedback.lock"
+: > "$LOCK_FILE"  # idempotent — touch the lock file (no truncate concern)
+
+(
+    flock -x -w 5 9 || {
+        echo "[log-wake-feedback] failed to acquire lock within 5s" >&2
+        exit 1
+    }
+    # Inside the lock: create file with header if missing, then append.
+    if [ ! -s "$LOG_FILE" ]; then
+        cat > "$LOG_FILE" <<'HEADER'
 # Wake Mechanism Feedback Log
 
 This file collects post-hoc evaluations of wake events from Claude Code sessions.
@@ -118,15 +146,8 @@ design rationale.
 ---
 
 HEADER
-fi
-
-# Append the entry under an exclusive file lock.
-(
-    flock -x -w 5 9 || {
-        echo "[log-wake-feedback] failed to acquire lock on $LOG_FILE within 5s" >&2
-        exit 1
-    }
+    fi
     printf '%s\n' "$entry" >> "$LOG_FILE"
-) 9>>"$LOG_FILE"
+) 9>"$LOCK_FILE"
 
 echo "[log-wake-feedback] logged: $event $repo${pr:+ PR #$pr} → $classification" >&2
