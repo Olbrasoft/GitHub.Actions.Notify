@@ -14,6 +14,14 @@ fi
 # Detect current repository to filter events
 REPO_PREFIX=$(git remote get-url origin 2>/dev/null | sed 's|.*github.com[:/]||;s|\.git$||' | tr '/' '-')
 
+# If we cannot determine the current repository, do not process any events.
+# An empty prefix would broaden the glob to ALL event files in the directory
+# and we would delete notifications for other repos. Bail silently — the
+# next prompt from inside a real repo will pick them up.
+if [ -z "$REPO_PREFIX" ]; then
+  exit 0
+fi
+
 # Process only events for current repository
 for event_file in "$EVENTS_DIR"/${REPO_PREFIX}*.json; do
   [ -f "$event_file" ] || continue

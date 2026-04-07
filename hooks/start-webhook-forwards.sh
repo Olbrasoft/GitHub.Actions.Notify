@@ -11,7 +11,16 @@ REPOS=(
   "Olbrasoft/Blog"
 )
 
-# Clean up zombie webhook-forwarder hooks left by previous crashes
+# Clean up zombie webhook-forwarder hooks left by previous crashes of this
+# service. KNOWN LIMITATION: this scope is "all hooks pointing at the gh
+# webhook-forwarder URL", which means a second concurrently running
+# `gh webhook forward` (e.g. another developer's machine sharing the same
+# repo, or a manually started one) would have its hooks deleted too.
+# In practice this is acceptable because gh webhook forward is a
+# per-developer service running once per machine; running it twice for the
+# same repo on the same machine is the failure mode this cleanup recovers
+# from. If we ever need cross-instance safety, track our hook IDs in a
+# state file under $XDG_RUNTIME_DIR and delete only those.
 for REPO in "${REPOS[@]}"; do
   HOOK_IDS=$(gh api "repos/$REPO/hooks" --jq '.[] | select(.config.url == "https://webhook-forwarder.github.com/hook") | .id' 2>/dev/null)
   for HOOK_ID in $HOOK_IDS; do
@@ -20,8 +29,21 @@ for REPO in "${REPOS[@]}"; do
   done
 done
 
-# Start webhook receiver
-python3 /home/jirka/.claude/hooks/webhook-receiver.py 9877 &
+# Start webhook receiver. Resolve the path via $HOME so this works for any
+# user/machine after `./hooks/install.sh` has run. Validate the file exists
+# and is readable before launching to fail fast with a clear error.
+if [ -z "$HOME" ]; then
+  echo "[webhook-forwards] HOME is not set; cannot resolve webhook receiver path" >&2
+  exit 1
+fi
+
+RECEIVER_PATH="$HOME/.claude/hooks/webhook-receiver.py"
+if [ ! -f "$RECEIVER_PATH" ] || [ ! -r "$RECEIVER_PATH" ]; then
+  echo "[webhook-forwards] Receiver script not found or not readable: $RECEIVER_PATH" >&2
+  exit 1
+fi
+
+python3 "$RECEIVER_PATH" 9877 &
 RECEIVER_PID=$!
 sleep 1
 

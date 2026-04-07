@@ -24,7 +24,12 @@ def _wake(repo_name, branch=None):
         args = [wake_script, repo_name]
         if branch:
             args.append(branch)
-        subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        # Use DEVNULL for stderr — nothing reads the pipe in this process, so
+        # PIPE would let the kernel buffer fill up and eventually block the
+        # child or leak file descriptors over time. wake-claude.sh's own
+        # stderr is preserved by the systemd journal of gh-webhook-forward.service
+        # if we ever need to debug it; for that, run wake-claude.sh manually.
+        subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         branch_info = f" branch={branch}" if branch else ""
         print(f"[webhook-receiver] Wake signal sent for {repo_name}{branch_info}",
               file=sys.stderr)

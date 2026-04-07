@@ -45,10 +45,19 @@ mkfifo "$FIFO" 2>/dev/null || exit 0
 # Register session: repo, branch, PID, CWD. The branch field is a cached
 # hint only — wake-claude.sh queries the live branch from cwd at wake time
 # instead of trusting this cache.
+#
+# Use jq to construct the JSON so that branch names with quotes/backslashes
+# and unusual cwd paths cannot produce invalid JSON that would break
+# wake-claude.sh's `jq -r` parsing.
 write_registration() {
-    cat > "$REG" << EOF
-{"pid": $PID, "branch": "$BRANCH", "repo": "$REPO", "cwd": "$(pwd)"}
-EOF
+    local cwd
+    cwd=$(pwd)
+    jq -n \
+        --argjson pid "$PID" \
+        --arg branch "$BRANCH" \
+        --arg repo "$REPO" \
+        --arg cwd "$cwd" \
+        '{pid: $pid, branch: $branch, repo: $repo, cwd: $cwd}' > "$REG"
 }
 write_registration
 
@@ -58,6 +67,14 @@ write_registration
 process_event() {
     local event_data="$1"
     [ -z "$event_data" ] && return 1
+
+    # Validate the payload is parseable JSON before extracting fields. If it
+    # is not, return non-zero so the caller knows to keep the source file
+    # for a retry instead of silently dropping the event.
+    if ! echo "$event_data" | jq empty 2>/dev/null; then
+        echo "[wake-on-event] event payload is not valid JSON; refusing to process" >&2
+        return 1
+    fi
 
     local event_type status repo_name
     event_type=$(echo "$event_data" | jq -r '.event // "unknown"')
@@ -150,9 +167,16 @@ if [ -d "$EVENTS_DIR" ]; then
     if [ -n "$OLDEST" ]; then
         PENDING_DATA=$(cat "$OLDEST" 2>/dev/null)
         if [ -n "$PENDING_DATA" ]; then
-            rm -f "$OLDEST"
-            process_event "$PENDING_DATA"
-            exit 2
+            # Process FIRST, delete only if processing succeeded. This avoids
+            # losing the event on a transient failure (e.g. jq parse error
+            # mid-script). asyncRewake will respawn us and we will try again.
+            if process_event "$PENDING_DATA"; then
+                rm -f "$OLDEST"
+                exit 2
+            else
+                echo "[wake-on-event] process_event failed for $OLDEST; leaving file for retry" >&2
+                exit 2
+            fi
         fi
     fi
 fi

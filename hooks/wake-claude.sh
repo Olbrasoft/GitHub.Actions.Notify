@@ -70,11 +70,17 @@ fi
 # consumed the data, so write-success == ack. Bounded by a timeout in case
 # the consumer is wedged.
 #
+# The payload is passed via environment variables (not argv) so it does not
+# count against ARG_MAX, and printf is used instead of echo so that backslash
+# escapes and leading hyphens in the payload are preserved verbatim.
+#
 # Returns 0 on success (acked), 1 on failure or timeout.
 write_with_ack() {
     local fifo="$1"
     local data="$2"
-    timeout "$FIFO_WRITE_TIMEOUT" bash -c "echo \"\$0\" > \"\$1\"" "$data" "$fifo" 2>/dev/null
+    WAKE_DATA="$data" WAKE_FIFO="$fifo" \
+        timeout "$FIFO_WRITE_TIMEOUT" \
+        bash -c 'printf "%s" "$WAKE_DATA" > "$WAKE_FIFO"' 2>/dev/null
 }
 
 deliver_event() {
