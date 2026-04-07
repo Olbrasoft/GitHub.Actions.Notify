@@ -393,7 +393,54 @@ process_event_file() {
 ###############################################################################
 # Main: process all event files for this repo
 ###############################################################################
+#
+# Dedup duplicate events within this invocation. The legacy filename scheme
+# for deploy/verify events includes {run_id}-{run_attempt}, so workflow
+# re-runs produce multiple files for the same logical event:
+#
+#   Olbrasoft-cr-verify-abc1234-241234-1.json
+#   Olbrasoft-cr-verify-abc1234-241235-1.json   # re-run
+#
+# Both files contain the same (event_type, commit) tuple. We pick the file
+# with the LATEST timestamp inside the JSON for each (event_type, commit)
+# key, deliver only that one, and drop the rest. This ensures the consumer
+# session is woken at most once per logical event per wake-claude.sh call.
 
+declare -A event_winner   # key: "event_type|commit" → file path
+declare -A event_winner_ts  # key: "event_type|commit" → timestamp
+
+for ef in "$EVENTS_DIR"/${REPO_FILE}*.json; do
+    [ -f "$ef" ] || continue
+    # Read minimum metadata to dedup. Skip files we cannot parse — let the
+    # main loop drop them with the standard "invalid JSON" diagnostic.
+    if ! jq empty "$ef" 2>/dev/null; then
+        continue
+    fi
+    et=$(jq -r '.event // ""' "$ef" 2>/dev/null)
+    sha=$(jq -r '.commit // ""' "$ef" 2>/dev/null)
+    ts=$(jq -r '.timestamp // ""' "$ef" 2>/dev/null)
+    # If we cannot identify the logical key, treat the file as unique.
+    if [ -z "$et" ] || [ -z "$sha" ]; then
+        continue
+    fi
+    key="$et|$sha"
+    if [ -z "${event_winner[$key]:-}" ] || [[ "$ts" > "${event_winner_ts[$key]:-}" ]]; then
+        # Drop the previous winner for this key (it is a logical duplicate
+        # superseded by a newer file).
+        if [ -n "${event_winner[$key]:-}" ]; then
+            log "DEDUP drop ${event_winner[$key]##*/} (superseded by ${ef##*/} for $key)"
+            rm -f "${event_winner[$key]}"
+        fi
+        event_winner[$key]="$ef"
+        event_winner_ts[$key]="$ts"
+    else
+        log "DEDUP drop ${ef##*/} (older than ${event_winner[$key]##*/} for $key)"
+        rm -f "$ef"
+    fi
+done
+
+# Now process each surviving file (one per logical key, plus any unparseable
+# leftovers).
 for ef in "$EVENTS_DIR"/${REPO_FILE}*.json; do
     [ -f "$ef" ] || continue
     process_event_file "$ef"
