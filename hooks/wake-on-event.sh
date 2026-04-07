@@ -1,78 +1,111 @@
 #!/bin/bash
 # asyncRewake hook for Claude Code: per-session FIFO consumer.
 #
-# Lifecycle:
-#   1. Spawned by Claude Code as an asyncRewake hook
-#   2. Detect repo from `git remote get-url origin` in cwd
-#   3. Create FIFO at /tmp/claude-wake/{REPO}/{PID}.fifo and registration JSON
-#   4. Drain any pending event files for this repo (catches the race where
-#      an event arrived while no hook was registered)
-#   5. If a pending event was found, process it and exit 2 → Claude re-spawns us
-#   6. Otherwise block on the FIFO with a 600s timeout
-#   7. On FIFO read: process event, output instructions to stderr, exit 2
-#   8. On timeout: refresh branch in registration JSON, loop back to step 6
+# Session-bound design (see docs/architecture.md):
+#   - Each Claude session has ONE FIFO at /tmp/claude-wake/.session-{PID}.fifo
+#     (regardless of how many repos the session works in).
+#   - The FIFO is referenced by the session manifest at
+#     /tmp/claude-wake/.session-{PID}.json which records pid + fifo path.
+#   - PR ownership lives in ~/.config/claude-channels/pr-owners/ — created by
+#     the PostToolUse auto-register hook when `gh pr create` succeeds. This
+#     hook does NOT manage ownership — it only owns the FIFO.
+#   - Cleanup on EXIT removes the FIFO, the session manifest, and any
+#     ~/.config/claude-channels/pr-owners/*.json that points at this PID.
+#     A dead session leaves no orphans.
 #
-# Why two paths (drain pending + FIFO):
-#   FIFO is the fast path for live delivery from wake-claude.sh.
-#   Pending file drain catches events that arrived while no hook was registered.
-#   Both paths terminate with exit 2 so Claude Code knows to re-prompt the
-#   assistant with the stderr output as a system reminder.
+# Lifecycle:
+#   1. Spawned by Claude Code on SessionStart and on every Stop event
+#      (asyncRewake true).
+#   2. Walk up the process tree to find the Claude PID (the parent of this
+#      hook subprocess).
+#   3. Create FIFO + manifest if they don't already exist.
+#   4. Block on `cat $FIFO` with a 600s timeout.
+#   5. On read: process the event payload, write instructions to stderr,
+#      exit 2 — Claude Code re-prompts the assistant with the stderr as a
+#      system reminder, achieving the "wake".
+#   6. On timeout: just loop back. The wake mechanism is event-driven; the
+#      timeout exists only so the cat doesn't block forever in case
+#      something goes wrong.
+#   7. On real EXIT (Claude session ends, hook is killed): the trap fires
+#      and removes everything.
 
-REPO=$(git remote get-url origin 2>/dev/null | sed 's|.*github.com[:/]||;s|\.git$||' | tr '/' '-')
-[ -z "$REPO" ] && exit 0
+set -u
 
-BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
-PID=$$
-WAKE_DIR="/tmp/claude-wake/$REPO"
-FIFO="$WAKE_DIR/$PID.fifo"
-REG="$WAKE_DIR/$PID.json"
-EVENTS_DIR="$HOME/.config/claude-channels/deploy-events"
+WAKE_DIR="/tmp/claude-wake"
+PR_OWNERS_DIR="$HOME/.config/claude-channels/pr-owners"
 
-mkdir -p "$WAKE_DIR"
+mkdir -p "$WAKE_DIR" "$PR_OWNERS_DIR"
 
-# Cleanup on exit
+# Find the Claude process PID by walking up the process tree from this hook.
+# Try each ancestor and stop at the first one whose comm is "claude".
+find_claude_pid() {
+    local pid=$PPID
+    local i=0
+    while [ "$pid" != "1" ] && [ "$i" -lt 10 ]; do
+        local comm
+        comm=$(cat "/proc/$pid/comm" 2>/dev/null || echo "")
+        if [ "$comm" = "claude" ]; then
+            echo "$pid"
+            return 0
+        fi
+        pid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null || echo 1)
+        i=$((i + 1))
+    done
+    # Fallback: use direct parent PID. Better than nothing.
+    echo "$PPID"
+}
+
+CLAUDE_PID=$(find_claude_pid)
+FIFO="$WAKE_DIR/.session-${CLAUDE_PID}.fifo"
+MANIFEST="$WAKE_DIR/.session-${CLAUDE_PID}.json"
+
+# Cleanup on real exit only (not on exit 2 → Claude re-spawns us). The
+# distinction matters because exit 2 is the "wake" signal: we want the
+# session to keep its FIFO so the NEXT spawned hook instance picks up
+# delivery. Cleanup must only happen when the Claude process itself is
+# really gone.
 cleanup() {
-    rm -f "$FIFO" "$REG"
+    # Only purge if the parent Claude process is dead. Otherwise this is
+    # an exit-2 cycle and the FIFO is still needed.
+    if ! kill -0 "$CLAUDE_PID" 2>/dev/null; then
+        rm -f "$FIFO" "$MANIFEST"
+        # Drop any PR ownerships for this PID — dead owner = drop all events
+        for owner in "$PR_OWNERS_DIR"/*.json; do
+            [ -f "$owner" ] || continue
+            local_pid=$(jq -r '.pid // 0' "$owner" 2>/dev/null)
+            if [ "$local_pid" = "$CLAUDE_PID" ]; then
+                rm -f "$owner"
+            fi
+        done
+    fi
 }
 trap cleanup EXIT
 
-# Remove stale FIFO/reg if they happen to exist (e.g. from a crashed instance)
-rm -f "$FIFO" "$REG"
+# Create FIFO + manifest if missing. The hook is spawned multiple times
+# during a session (SessionStart + every Stop), so this must be idempotent.
+if [ ! -p "$FIFO" ]; then
+    rm -f "$FIFO"
+    mkfifo "$FIFO" 2>/dev/null || exit 0
+fi
 
-# Create FIFO
-mkfifo "$FIFO" 2>/dev/null || exit 0
+# Write/refresh the session manifest. cwd may have changed since the last
+# run if the user navigated, but PID and FIFO are stable.
+jq -n \
+    --argjson pid "$CLAUDE_PID" \
+    --arg fifo "$FIFO" \
+    --arg cwd "$(pwd)" \
+    --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{pid: $pid, fifo: $fifo, cwd: $cwd, created: $created}' > "$MANIFEST"
 
-# Register session: repo, branch, PID, CWD. The branch field is a cached
-# hint only — wake-claude.sh queries the live branch from cwd at wake time
-# instead of trusting this cache.
-#
-# Use jq to construct the JSON so that branch names with quotes/backslashes
-# and unusual cwd paths cannot produce invalid JSON that would break
-# wake-claude.sh's `jq -r` parsing.
-write_registration() {
-    local cwd
-    cwd=$(pwd)
-    jq -n \
-        --argjson pid "$PID" \
-        --arg branch "$BRANCH" \
-        --arg repo "$REPO" \
-        --arg cwd "$cwd" \
-        '{pid: $pid, branch: $branch, repo: $repo, cwd: $cwd}' > "$REG"
-}
-write_registration
-
-# Process a single event JSON. Outputs human-readable instructions to stderr
-# (Claude Code captures and re-injects them as a system reminder when the
-# script exits with code 2).
+# Process a single event JSON payload received via FIFO. Outputs human-
+# readable instructions to stderr (Claude Code captures and re-injects them
+# as a system reminder when the script exits with code 2).
 process_event() {
     local event_data="$1"
     [ -z "$event_data" ] && return 1
 
-    # Validate the payload is parseable JSON before extracting fields. If it
-    # is not, return non-zero so the caller knows to keep the source file
-    # for a retry instead of silently dropping the event.
     if ! echo "$event_data" | jq empty 2>/dev/null; then
-        echo "[wake-on-event] event payload is not valid JSON; refusing to process" >&2
+        echo "[wake-on-event] event payload is not valid JSON" >&2
         return 1
     fi
 
@@ -144,55 +177,21 @@ process_event() {
     return 0
 }
 
-# Drain ONE pending event file for this repo (the oldest one). If found,
-# process it and exit 2 — Claude Code will respawn us, and on the next
-# instance we will either drain the next file or block on the FIFO.
-#
-# This catches the race where an event was written + wake-claude.sh called
-# while no hook was registered (e.g. between an exit-2 and the next
-# asyncRewake spawn). Without this drain such events would only be picked
-# up on the next UserPromptSubmit by check-deploy-status.sh, defeating the
-# point of push wake.
-if [ -d "$EVENTS_DIR" ]; then
-    OLDEST=""
-    OLDEST_MTIME=""
-    for pending in "$EVENTS_DIR"/${REPO}*.json; do
-        [ -f "$pending" ] || continue
-        MTIME=$(stat -c '%Y' "$pending" 2>/dev/null || echo 0)
-        if [ -z "$OLDEST" ] || [ "$MTIME" -lt "$OLDEST_MTIME" ]; then
-            OLDEST="$pending"
-            OLDEST_MTIME="$MTIME"
-        fi
-    done
-    if [ -n "$OLDEST" ]; then
-        PENDING_DATA=$(cat "$OLDEST" 2>/dev/null)
-        if [ -n "$PENDING_DATA" ]; then
-            # Process FIRST, delete only if processing succeeded. This avoids
-            # losing the event on a transient failure (e.g. jq parse error
-            # mid-script). asyncRewake will respawn us and we will try again.
-            if process_event "$PENDING_DATA"; then
-                rm -f "$OLDEST"
-                exit 2
-            else
-                echo "[wake-on-event] process_event failed for $OLDEST; leaving file for retry" >&2
-                exit 2
-            fi
-        fi
-    fi
-fi
-
-# No pending events — block on the FIFO with a 600s timeout. The timeout
-# loop refreshes the cached branch in the registration JSON in case the
-# user runs `git checkout`. wake-claude.sh queries live branch from cwd
-# at wake time so the cache is only a hint, but we still keep it fresh.
+# Block on the FIFO. The 600s timeout exists only as a safety belt; in
+# practice the Notifier writes events as soon as GitHub triggers them, and
+# this loop returns within seconds.
 while true; do
     if EVENT_DATA=$(timeout 600 cat "$FIFO" 2>/dev/null); then
-        # Something wrote to the FIFO — we got woken up with event data
         [ -z "$EVENT_DATA" ] && exit 2
         process_event "$EVENT_DATA"
         exit 2
     fi
-    # Timeout — refresh registration (branch might have changed)
-    BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
-    write_registration
+    # Timeout: nothing happened in 10 minutes. Loop and re-block.
+    # Refresh manifest with current cwd (cheap).
+    jq -n \
+        --argjson pid "$CLAUDE_PID" \
+        --arg fifo "$FIFO" \
+        --arg cwd "$(pwd)" \
+        --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{pid: $pid, fifo: $fifo, cwd: $cwd, created: $created}' > "$MANIFEST"
 done

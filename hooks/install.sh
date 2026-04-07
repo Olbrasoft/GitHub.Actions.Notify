@@ -25,8 +25,9 @@ HOOKS=(
     wake-on-event.sh
     wake-claude.sh
     webhook-receiver.py
-    check-deploy-status.sh
     start-webhook-forwards.sh
+    register-pr-owner.sh
+    auto-register-pr-from-tool-output.sh
 )
 
 MODE="install"
@@ -96,26 +97,63 @@ fi
 echo ""
 echo "[install] Summary: $install_count installed, $skip_count skipped"
 
-# Sanity-check Claude Code hook configuration
+# Sanity-check Claude Code hook configuration. Two hooks need to be wired:
+#
+#   1. wake-on-event.sh — asyncRewake on SessionStart and Stop. Provides
+#      the per-session FIFO and the wake mechanism.
+#   2. auto-register-pr-from-tool-output.sh — PostToolUse hook (matcher:
+#      "Bash"). Auto-registers PR ownership when `gh pr create` is run,
+#      so future events for that PR can be routed back to this session.
+#
+# The script does not modify settings.json directly (too risky); instead it
+# reports what is missing and prints a copy-paste-ready snippet.
 SETTINGS="$HOME/.claude/settings.json"
 if [ -f "$SETTINGS" ]; then
-    if grep -q "wake-on-event.sh" "$SETTINGS"; then
-        echo "[install] OK: wake-on-event.sh is referenced in $SETTINGS"
+    missing=()
+    grep -q "wake-on-event.sh" "$SETTINGS" || missing+=("wake-on-event.sh")
+    grep -q "auto-register-pr-from-tool-output.sh" "$SETTINGS" || missing+=("auto-register-pr-from-tool-output.sh")
+
+    if [ "${#missing[@]}" -eq 0 ]; then
+        echo "[install] OK: wake-on-event.sh and auto-register-pr-from-tool-output.sh are both referenced in $SETTINGS"
     else
         cat <<EOF >&2
 
-WARNING: wake-on-event.sh is not referenced in $SETTINGS.
-You need to add it as an asyncRewake hook. Example fragment:
+WARNING: $SETTINGS is missing one or more hook references:
+${missing[*]}
+
+Add the following fragments to the "hooks" section (merge with any
+existing entries):
 
   "hooks": {
-    "Stop": [
+    "SessionStart": [
       {
-        "matcher": "",
         "hooks": [
           {
             "type": "command",
             "command": "$INSTALL_DIR/wake-on-event.sh",
             "asyncRewake": true
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$INSTALL_DIR/wake-on-event.sh",
+            "asyncRewake": true
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$INSTALL_DIR/auto-register-pr-from-tool-output.sh"
           }
         ]
       }
@@ -125,7 +163,7 @@ You need to add it as an asyncRewake hook. Example fragment:
 EOF
     fi
 else
-    echo "[install] NOTE: $SETTINGS does not exist yet. Create it and register wake-on-event.sh as an asyncRewake hook." >&2
+    echo "[install] NOTE: $SETTINGS does not exist yet. Create it and register the hooks above." >&2
 fi
 
 # Sanity-check webhook forward systemd service (optional, only if user wants
