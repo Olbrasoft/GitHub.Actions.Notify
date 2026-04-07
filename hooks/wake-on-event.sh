@@ -161,7 +161,8 @@ process_event() {
                 if [ "$comments" = "0" ]; then
                     echo "If state=OPEN: merge with"
                     echo "  gh pr merge $pr_num --repo $repo_name --merge --delete-branch"
-                    echo "If state=MERGED or CLOSED: skip — nothing to do."
+                    echo "If state=MERGED: skip — work was already completed and merged."
+                    echo "If state=CLOSED (not merged): skip — the work was abandoned."
                 else
                     echo "If state=OPEN, review the comments and consider whether each is still relevant:"
                     echo "  gh api repos/$repo_name/pulls/$pr_num/comments --jq '.[].body'"

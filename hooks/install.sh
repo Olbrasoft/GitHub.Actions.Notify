@@ -8,10 +8,15 @@
 #
 # What this installs:
 #   - wake-on-event.sh           : asyncRewake hook (per-session FIFO consumer
-#                                  with orphan suicide and singleton check)
+#                                  with orphan suicide check)
 #   - wake-claude.sh             : producer-side notifier — enumerates running
 #                                  Claude sessions and delivers events to the
 #                                  correct one with bounded retry
+#   - check-deploy-status.sh     : UserPromptSubmit fallback reader. Drains any
+#                                  pending event files when the user submits a
+#                                  prompt. Last line of defense if FIFO push
+#                                  wake missed the event (or wake-claude.sh
+#                                  exhausted retries and DEFERred the file).
 #   - webhook-receiver.py        : HTTP listener for `gh webhook forward` (port 9877)
 #   - start-webhook-forwards.sh  : systemd service entrypoint (forwards + receiver)
 #
@@ -26,6 +31,7 @@ INSTALL_DIR="$HOME/.claude/hooks"
 HOOKS=(
     wake-on-event.sh
     wake-claude.sh
+    check-deploy-status.sh
     get-session-id.sh
     webhook-receiver.py
     start-webhook-forwards.sh
