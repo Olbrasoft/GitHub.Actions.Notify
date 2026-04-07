@@ -1,6 +1,6 @@
 # GitHub.Actions.Notify
 
-Reusable GitHub Actions for CI/CD feedback with TTS voice notifications. Solves the problem of AI coding agents (Claude Code, OpenCode, etc.) "going blind" after creating a Pull Request — they don't know when CI finishes, code review completes, or deploy succeeds.
+Reusable GitHub Actions for CI/CD feedback with TTS voice notifications and FIFO Push Wake. Solves the problem of AI coding agents (Claude Code, OpenCode, etc.) "going blind" after creating a Pull Request — they don't know when CI finishes, code review completes, or deploy succeeds.
 
 ## Problem
 
