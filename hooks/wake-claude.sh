@@ -391,6 +391,37 @@ process_event_file() {
 }
 
 ###############################################################################
+# Sweep stale per-session FIFOs and manifests for dead Claude PIDs
+###############################################################################
+#
+# wake-on-event.sh installs a cleanup() trap that removes its FIFO + manifest
+# when the script exits AND the Claude PID is dead. But the trap only fires
+# inside a *running* hook process. If the Claude session dies while no hook
+# is currently in cat (the asyncRewake hook only spawns at SessionStart/Stop
+# boundaries), the trap never runs and the FIFO leaks. See bug 36.
+#
+# We sweep at the start of every wake-claude.sh invocation: cheap, idempotent,
+# and runs whenever there is wake activity for any repo.
+sweep_stale_session_files() {
+    local f pid
+    for f in "$WAKE_DIR"/.session-*.fifo "$WAKE_DIR"/.session-*.json; do
+        [ -e "$f" ] || continue
+        pid="${f##*/.session-}"
+        pid="${pid%.fifo}"
+        pid="${pid%.json}"
+        # Numeric PID check — skip anything that does not match the pattern.
+        case "$pid" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        if ! kill -0 "$pid" 2>/dev/null; then
+            log "Sweeping stale ${f##*/} (PID $pid dead)"
+            rm -f "$f"
+        fi
+    done
+}
+sweep_stale_session_files
+
+###############################################################################
 # Main: process all event files for this repo
 ###############################################################################
 #

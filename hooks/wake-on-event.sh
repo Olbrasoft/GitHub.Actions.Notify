@@ -212,8 +212,27 @@ process_event() {
 # Main loop: block on FIFO
 ###############################################################################
 
+# Re-check that the parent Claude process is still alive. The startup
+# suicide check (line 62) only fires once, but the loop below blocks for
+# up to 600s in `cat $FIFO`. If the parent dies during that block, the
+# hook gets reparented to systemd-user and would otherwise stay alive
+# forever, accumulating one orphan per dead session. See bug 32.
+parent_alive() {
+    kill -0 "$CLAUDE_PID" 2>/dev/null
+}
+
 while true; do
+    if ! parent_alive; then
+        exit 0
+    fi
     if EVENT_DATA=$(timeout 600 cat "$FIFO" 2>/dev/null); then
+        # After cat returns (event arrived OR EOF), re-check liveness
+        # before doing any work. The parent may have died while we were
+        # blocked, in which case there is no one to inject our stderr
+        # back to and any further processing is wasted effort.
+        if ! parent_alive; then
+            exit 0
+        fi
         [ -z "$EVENT_DATA" ] && exit 2
         process_event "$EVENT_DATA"
         exit 2
