@@ -150,10 +150,27 @@ process_event() {
                 pr_num=$(echo "$event_data" | jq -r '.prNumber // "unknown"')
                 pr_url=$(echo "$event_data" | jq -r '.prUrl // ""')
                 comments=$(echo "$event_data" | jq -r '.reviewComments // 0')
-                echo "Code review on $repo_name PR #$pr_num: $comments comments (status: $status)"
+                echo "Code review COMPLETE on $repo_name PR #$pr_num: $comments comment(s)"
                 [ -n "$pr_url" ] && echo "PR: $pr_url"
-                echo "Read comments: gh api repos/$repo_name/pulls/$pr_num/comments --jq '.[].body'"
-                echo "Fix all issues, push, notify user via mcp__notify__notify."
+                echo ""
+                if [ "$comments" = "0" ]; then
+                    echo "ZERO COMMENTS — execute this single command, no other action allowed before it:"
+                    echo ""
+                    echo "  gh pr merge $pr_num --repo $repo_name --merge --delete-branch"
+                    echo ""
+                    echo "After the merge succeeds, send mcp__notify__notify with the result. Do not report progress before merging. Do not ask the user for permission. Do not switch to other tasks."
+                else
+                    echo "$comments COMMENT(S) — execute this exact sequence in order, no other action allowed in between:"
+                    echo ""
+                    echo "  1. gh api repos/$repo_name/pulls/$pr_num/comments --jq '.[].body'"
+                    echo "  2. Fix every comment in the working tree"
+                    echo "  3. git add -A && git commit -m \"fix: address Copilot review on PR #$pr_num\""
+                    echo "  4. git push"
+                    echo "  5. gh pr merge $pr_num --repo $repo_name --merge --delete-branch"
+                    echo "  6. mcp__notify__notify with the merge result"
+                    echo ""
+                    echo "Steps 1–5 are a single transaction. Do not stop between steps. Do not report progress to the user before step 5 succeeds. Do not ask permission. Do not switch tasks. The fix-and-merge is mandatory and atomic."
+                fi
                 ;;
             ci-complete)
                 local pr_num pr_branch
