@@ -111,6 +111,46 @@ jq -n \
 # Event processing
 ###############################################################################
 
+# Forensics directory for invalid payloads. Each parse failure dumps the
+# raw bytes of the offending payload here so we can finally see what is
+# arriving on the FIFO when the consumer reports "not valid JSON". Resolved
+# with explicit safe defaults for both XDG_CONFIG_HOME and HOME, since the
+# whole script runs under `set -u` and we must not abort if either env var
+# happens to be unset.
+INVALID_PAYLOADS_DIR=""
+if [ -n "${XDG_CONFIG_HOME:-}" ]; then
+    INVALID_PAYLOADS_DIR="$XDG_CONFIG_HOME/claude-channels/invalid-payloads"
+elif [ -n "${HOME:-}" ]; then
+    INVALID_PAYLOADS_DIR="$HOME/.config/claude-channels/invalid-payloads"
+fi
+
+# Dump a payload to the forensics directory for later inspection.
+# Returns the path of the dumped file on stdout if (and only if) the file
+# was actually created. On any failure (no dir, mkdir fails, write fails)
+# this prints nothing so callers don't claim a dump location that does
+# not exist on disk.
+dump_invalid_payload() {
+    local payload="$1"
+    local origin="$2"
+    [ -n "$INVALID_PAYLOADS_DIR" ] || return 0
+    mkdir -p "$INVALID_PAYLOADS_DIR" 2>/dev/null || return 0
+    local stamp
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    local out="$INVALID_PAYLOADS_DIR/${stamp}-pid${CLAUDE_PID}-${origin}.txt"
+    if {
+        printf 'timestamp_utc: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        printf 'claude_pid: %s\n' "$CLAUDE_PID"
+        printf 'fifo: %s\n' "$FIFO"
+        printf 'origin: %s\n' "$origin"
+        printf 'payload_length_bytes: %s\n' "${#payload}"
+        printf '----- raw payload (od -c) -----\n'
+        printf '%s' "$payload" | od -c 2>/dev/null || true
+        printf '----- end raw payload -----\n'
+    } >"$out" 2>/dev/null && [ -s "$out" ]; then
+        echo "$out"
+    fi
+}
+
 # Render an event JSON payload as human-readable instructions on stderr.
 # Claude Code captures stderr and re-injects it as a system reminder when
 # we exit with code 2.
@@ -119,7 +159,28 @@ process_event() {
     [ -z "$event_data" ] && return 1
 
     if ! echo "$event_data" | jq empty 2>/dev/null; then
-        echo "[wake-on-event] event payload is not valid JSON" >&2
+        # Dump the offending payload so we can finally diagnose what
+        # producer is writing it. The dump goes to a separate forensics
+        # file (NOT stderr) so the system reminder stays compact and
+        # actionable.
+        local dump_path
+        dump_path=$(dump_invalid_payload "$event_data" "process_event")
+        {
+            echo "[wake-on-event] WAKE EVENT RECEIVED but payload was not valid JSON"
+            if [ -n "$dump_path" ]; then
+                echo "Raw bytes dumped to: $dump_path"
+            fi
+            echo ""
+            echo "DO NOT passively wait for another wake event. Instead:"
+            echo "  1. Identify which PR you are currently working on (the branch you pushed last)"
+            echo "  2. Check its state: gh pr view <PR> --repo <REPO> --json state,mergeable,mergeStateStatus,statusCheckRollup"
+            echo "  3. If state=OPEN and all CI checks are SUCCESS and Copilot has already reviewed (commented or approved) once, MERGE NOW:"
+            echo "       gh pr merge <PR> --repo <REPO> --merge --delete-branch"
+            echo "     Copilot reviews each PR EXACTLY ONCE — there will be NO second review wake event after a fix push."
+            echo "  4. If CI is still pending → continue your other work; another wake event will fire when it finishes."
+            echo "  5. If state=MERGED or CLOSED → there is nothing to do."
+            echo "  6. Notify user via mcp__notify__notify with what you decided."
+        } >&2
         return 1
     fi
 

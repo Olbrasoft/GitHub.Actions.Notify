@@ -211,17 +211,36 @@ When `deploy-complete` has `status: failure`, the `failedStep` field tells you w
 
 ## State Machine
 
+The state machine is split into TWO phases by Copilot's review:
+
+**Phase A — initial commit, awaiting first Copilot review:**
+
 | State | Trigger | Autonomous Action |
 |---|---|---|
 | ISSUE_ASSIGNED | start | Implement, create branch, commit, push, create PR |
 | CI_PENDING | — | Silent wait (CI runs on GitHub cloud) |
-| CI_FAILED | — | Analyze logs → fix → push |
-| CI_PASSED | — | Wait for review push notification |
-| REVIEW_COMPLETE | push (asyncRewake) | Read comments, fix if any → push fixes → MERGE (no re-review will fire — Copilot reviews each PR exactly once, see Critical Rule #7) |
+| CI_FAILED | — | Analyze logs → fix → push (still in Phase A — back to CI_PENDING) |
+| CI_PASSED_AWAITING_REVIEW | — | Wait for `code-review-complete` push notification |
+| REVIEW_COMPLETE | push (asyncRewake) | Read comments, fix if any → push fixes → **transition to Phase B** |
+
+**Phase B — fix push after first Copilot review, NO second review will fire:**
+
+| State | Trigger | Autonomous Action |
+|---|---|---|
+| AWAITING_FIX_CI | — | Wait for `ci-complete` push notification on the fix commit |
+| FIX_CI_FAILED | push (asyncRewake) | Read failed logs, fix more, push (still Phase B — back to AWAITING_FIX_CI) |
+| FIX_CI_PASSED | push (asyncRewake) | **MERGE IMMEDIATELY** — Copilot reviews each PR EXACTLY ONCE, Critical Rule #7 applies. Do NOT mention "waiting for Copilot review" in notifications. Do NOT enter CI_PASSED_AWAITING_REVIEW again. |
 | PR_MERGED | — | Wait for deploy push notification |
+
+**Phase C — post-merge:**
+
+| State | Trigger | Autonomous Action |
+|---|---|---|
 | DEPLOY_COMPLETE | push (asyncRewake) | Verify production (health + Playwright) |
 | DEPLOY_FAILED | push (asyncRewake) | Notify error |
 | VERIFIED | after Playwright | Notify per-issue results → close issue |
+
+**Key invariant:** Phase B is NEVER re-entered if Copilot has already reviewed once. Once you have pushed a fix in response to Copilot, the next `ci-complete success` event always means MERGE. Notifications during Phase B must NOT include the phrase "čekám na Copilot review" / "waiting for Copilot review" — the only thing being waited on in Phase B is CI on the fix commit.
 
 ## Server / Docker Rules
 
