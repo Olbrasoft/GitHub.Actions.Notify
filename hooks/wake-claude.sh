@@ -343,15 +343,25 @@ process_event_file() {
     [ -f "$event_file" ] || return
 
     local event_data
-    event_data=$(cat "$event_file" 2>/dev/null)
+    # Compact the JSON to a single line (no internal newlines) so the
+    # NDJSON consumer (wake-on-event.sh `read -r`) gets the whole event in
+    # one line. Producers in the wild (jq -n with no -c flag, GitHub
+    # Actions workflow yaml that pipes structured data, etc.) emit
+    # pretty-printed JSON with internal newlines, which would otherwise
+    # terminate the consumer's `read -r` at the first inner newline,
+    # leaving it with a `{` fragment that fails jq parse. Bug observed
+    # repeatedly during 2026-04-08 session as recurring
+    # "[wake-on-event] event payload is not valid JSON" wake errors —
+    # the NDJSON delimiting fix in PR #38 only solved one half of the
+    # problem (separating events) but did not handle the case where a
+    # single event already contained internal newlines.
+    # `jq -c .` parses, validates and compacts in one shot. If the file
+    # is empty, missing or malformed JSON, jq exits non-zero and
+    # event_data ends up empty. The single check below covers all of
+    # those: empty file, missing file, malformed JSON.
+    event_data=$(jq -c . "$event_file" 2>/dev/null)
     if [ -z "$event_data" ]; then
-        log "DROP empty: ${event_file##*/}"
-        rm -f "$event_file"
-        return
-    fi
-
-    if ! echo "$event_data" | jq empty 2>/dev/null; then
-        log "DROP invalid JSON: ${event_file##*/}"
+        log "DROP empty/invalid: ${event_file##*/}"
         rm -f "$event_file"
         return
     fi
