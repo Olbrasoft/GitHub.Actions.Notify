@@ -113,20 +113,31 @@ jq -n \
 
 # Forensics directory for invalid payloads. Each parse failure dumps the
 # raw bytes of the offending payload here so we can finally see what is
-# arriving on the FIFO when the consumer reports "not valid JSON". The
-# directory is created lazily so the script does not fail if HOME is unset.
-INVALID_PAYLOADS_DIR="$HOME/.config/claude-channels/invalid-payloads"
+# arriving on the FIFO when the consumer reports "not valid JSON". Resolved
+# with explicit safe defaults for both XDG_CONFIG_HOME and HOME, since the
+# whole script runs under `set -u` and we must not abort if either env var
+# happens to be unset.
+INVALID_PAYLOADS_DIR=""
+if [ -n "${XDG_CONFIG_HOME:-}" ]; then
+    INVALID_PAYLOADS_DIR="$XDG_CONFIG_HOME/claude-channels/invalid-payloads"
+elif [ -n "${HOME:-}" ]; then
+    INVALID_PAYLOADS_DIR="$HOME/.config/claude-channels/invalid-payloads"
+fi
 
 # Dump a payload to the forensics directory for later inspection.
-# Returns the path of the dumped file on stdout (or empty on failure).
+# Returns the path of the dumped file on stdout if (and only if) the file
+# was actually created. On any failure (no dir, mkdir fails, write fails)
+# this prints nothing so callers don't claim a dump location that does
+# not exist on disk.
 dump_invalid_payload() {
     local payload="$1"
     local origin="$2"
+    [ -n "$INVALID_PAYLOADS_DIR" ] || return 0
     mkdir -p "$INVALID_PAYLOADS_DIR" 2>/dev/null || return 0
     local stamp
     stamp=$(date -u +%Y%m%dT%H%M%SZ)
     local out="$INVALID_PAYLOADS_DIR/${stamp}-pid${CLAUDE_PID}-${origin}.txt"
-    {
+    if {
         printf 'timestamp_utc: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
         printf 'claude_pid: %s\n' "$CLAUDE_PID"
         printf 'fifo: %s\n' "$FIFO"
@@ -135,8 +146,9 @@ dump_invalid_payload() {
         printf '----- raw payload (od -c) -----\n'
         printf '%s' "$payload" | od -c 2>/dev/null || true
         printf '----- end raw payload -----\n'
-    } >"$out" 2>/dev/null
-    echo "$out"
+    } >"$out" 2>/dev/null && [ -s "$out" ]; then
+        echo "$out"
+    fi
 }
 
 # Render an event JSON payload as human-readable instructions on stderr.
