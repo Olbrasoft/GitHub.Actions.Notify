@@ -35,32 +35,60 @@ os.makedirs(EVENTS_DIR, exist_ok=True)
 #
 # The in-memory cache survives wake-claude.sh's file deletion, so step 5
 # becomes "in-memory cache hit → skip" instead of "file missing → re-emit".
-# Entries expire after CI_DEDUP_TTL_SECONDS so a genuinely-new commit on
-# the same PR can still emit cleanly later.
+#
+# Entries expire after CI_DEDUP_TTL_SECONDS to bound memory use and to
+# allow re-emission of the same (repo, PR, commit, status) tuple after
+# a while if some downstream consumer never picked it up. New commits
+# on the same PR are NOT blocked by the cache regardless of TTL,
+# because the head SHA is part of the key.
 _ci_dedup_cache = {}
 _ci_dedup_lock = threading.Lock()
 CI_DEDUP_TTL_SECONDS = 600  # 10 minutes
 
 
-def _ci_dedup_check_and_mark(repo_name, pr_number, head_sha, status):
-    """Return True if this (repo, pr, commit, status) was already emitted
-    recently. Otherwise mark it as emitted and return False.
+def _ci_dedup_expire_locked(now):
+    """Garbage-collect expired dedup entries.
 
-    Thread-safe under the receiver's HTTP server which uses a thread per
-    request via BaseHTTPServer's default ThreadingMixIn behaviour.
+    Caller must hold _ci_dedup_lock.
+    """
+    expired = [k for k, ts in _ci_dedup_cache.items()
+               if now - ts > CI_DEDUP_TTL_SECONDS]
+    for k in expired:
+        del _ci_dedup_cache[k]
+
+
+def _ci_dedup_check(repo_name, pr_number, head_sha, status):
+    """Return True if this (repo, pr, commit, status) was already emitted
+    recently, otherwise return False.
+
+    This helper does NOT mutate the dedup cache. The caller must invoke
+    _ci_dedup_mark_emitted() only AFTER the event has been successfully
+    persisted to disk, so that an exception during file I/O doesn't
+    cause the cache to silently suppress a legitimate retry for up to
+    CI_DEDUP_TTL_SECONDS.
+
+    Access to the cache is protected by a lock so this remains safe if
+    the receiver is ever run in a multi-threaded context.
     """
     key = (repo_name, pr_number, head_sha, status)
     now = time.time()
     with _ci_dedup_lock:
-        # Garbage-collect expired entries opportunistically on every call
-        expired = [k for k, ts in _ci_dedup_cache.items()
-                   if now - ts > CI_DEDUP_TTL_SECONDS]
-        for k in expired:
-            del _ci_dedup_cache[k]
-        if key in _ci_dedup_cache:
-            return True
+        _ci_dedup_expire_locked(now)
+        return key in _ci_dedup_cache
+
+
+def _ci_dedup_mark_emitted(repo_name, pr_number, head_sha, status):
+    """Record a successfully persisted CI event as emitted.
+
+    Call this only AFTER the event file has been written and renamed
+    into place — never before, otherwise a failure during file I/O
+    would suppress legitimate retries.
+    """
+    key = (repo_name, pr_number, head_sha, status)
+    now = time.time()
+    with _ci_dedup_lock:
+        _ci_dedup_expire_locked(now)
         _ci_dedup_cache[key] = now
-        return False
 
 
 def _reap_in_background(proc):
@@ -269,7 +297,12 @@ class WebhookHandler(BaseHTTPRequestHandler):
         # workflows fire for the same head SHA — gets deduped here
         # instead of generating a duplicate wake event. See top-of-file
         # _ci_dedup_cache definition for full rationale.
-        if _ci_dedup_check_and_mark(repo_name, pr_number, head_sha, final_status):
+        #
+        # IMPORTANT: this is a non-mutating CHECK only. The cache is
+        # updated AFTER the event file has been successfully renamed
+        # into place (via _ci_dedup_mark_emitted). If the file write
+        # raises, the cache stays clean and a retry can still emit.
+        if _ci_dedup_check(repo_name, pr_number, head_sha, final_status):
             print(f"[webhook-receiver] PR #{pr_number}: ci-complete with "
                   f"status={final_status} for {head_sha_short} already emitted "
                   f"(in-memory dedup), skipping",
@@ -316,6 +349,11 @@ class WebhookHandler(BaseHTTPRequestHandler):
         with open(tmp_file, "w") as f:
             json.dump(event, f, indent=2)
         os.rename(tmp_file, event_file)
+
+        # File is now safely on disk. Only NOW mark the dedup cache so
+        # that any exception above (open, json.dump, rename) leaves the
+        # cache untouched and a retry can still emit. See review on PR #45.
+        _ci_dedup_mark_emitted(repo_name, pr_number, head_sha, final_status)
 
         print(f"[webhook-receiver] CI {final_status} event written: {repo_name} PR #{pr_number} "
               f"(branch: {pr_branch}, commit: {head_sha_short}, "
