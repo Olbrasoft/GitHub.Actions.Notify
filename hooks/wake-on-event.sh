@@ -181,18 +181,24 @@ process_event() {
                 pr_url=$(echo "$event_data" | jq -r '.prUrl // ""')
                 comments=$(echo "$event_data" | jq -r '.reviewComments // 0')
                 reviewer=$(echo "$event_data" | jq -r '.reviewer // ""')
-                # Copilot's reviewer identity differs across API surfaces:
+                # Copilot's reviewer login (the .user.login field — GitHub's
+                # account login/username, NOT the profile display name)
+                # differs across API surfaces:
                 #   - REST API (gh api .../reviews):  copilot-pull-request-reviewer[bot]
                 #   - REST API (gh pr view --json):   copilot-pull-request-reviewer
                 #   - Webhook payload (.user.login):  Copilot
                 # The webhook-receiver.py extracts user.login from the
-                # webhook payload, which gives the display-name "Copilot"
-                # — NOT the technical login. Match all three forms so the
-                # is_copilot path always fires for the bot regardless of
-                # which producer set the .reviewer field.
+                # webhook payload, which for this bot is the literal login
+                # "Copilot". Match all three forms exactly so the
+                # is_copilot path fires for the bot regardless of which
+                # producer set the .reviewer field, but does NOT match
+                # any human reviewer whose login happens to start with
+                # "Copilot" (e.g. "CopilotFan").
                 case "$reviewer" in
-                    copilot-pull-request-reviewer*|Copilot*) is_copilot=1 ;;
-                    *) is_copilot=0 ;;
+                    copilot-pull-request-reviewer|copilot-pull-request-reviewer\[bot\]|Copilot|Copilot\[bot\])
+                        is_copilot=1 ;;
+                    *)
+                        is_copilot=0 ;;
                 esac
                 echo "Code review COMPLETE on $repo_name PR #$pr_num by $reviewer: $comments comment(s)"
                 [ -n "$pr_url" ] && echo "PR: $pr_url"
