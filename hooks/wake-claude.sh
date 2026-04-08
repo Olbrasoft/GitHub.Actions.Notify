@@ -355,15 +355,13 @@ process_event_file() {
     # the NDJSON delimiting fix in PR #38 only solved one half of the
     # problem (separating events) but did not handle the case where a
     # single event already contained internal newlines.
+    # `jq -c .` parses, validates and compacts in one shot. If the file
+    # is empty, missing or malformed JSON, jq exits non-zero and
+    # event_data ends up empty. The single check below covers all of
+    # those: empty file, missing file, malformed JSON.
     event_data=$(jq -c . "$event_file" 2>/dev/null)
     if [ -z "$event_data" ]; then
         log "DROP empty/invalid: ${event_file##*/}"
-        rm -f "$event_file"
-        return
-    fi
-
-    if ! echo "$event_data" | jq empty 2>/dev/null; then
-        log "DROP invalid JSON: ${event_file##*/}"
         rm -f "$event_file"
         return
     fi
