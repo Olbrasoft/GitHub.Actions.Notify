@@ -181,11 +181,17 @@ process_event() {
                 pr_url=$(echo "$event_data" | jq -r '.prUrl // ""')
                 comments=$(echo "$event_data" | jq -r '.reviewComments // 0')
                 reviewer=$(echo "$event_data" | jq -r '.reviewer // ""')
-                # Copilot's bot login is "copilot-pull-request-reviewer" with
-                # an optional "[bot]" suffix depending on the API surface.
-                # Match the stable prefix so both forms count.
+                # Copilot's reviewer identity differs across API surfaces:
+                #   - REST API (gh api .../reviews):  copilot-pull-request-reviewer[bot]
+                #   - REST API (gh pr view --json):   copilot-pull-request-reviewer
+                #   - Webhook payload (.user.login):  Copilot
+                # The webhook-receiver.py extracts user.login from the
+                # webhook payload, which gives the display-name "Copilot"
+                # — NOT the technical login. Match all three forms so the
+                # is_copilot path always fires for the bot regardless of
+                # which producer set the .reviewer field.
                 case "$reviewer" in
-                    copilot-pull-request-reviewer*) is_copilot=1 ;;
+                    copilot-pull-request-reviewer*|Copilot*) is_copilot=1 ;;
                     *) is_copilot=0 ;;
                 esac
                 echo "Code review COMPLETE on $repo_name PR #$pr_num by $reviewer: $comments comment(s)"
