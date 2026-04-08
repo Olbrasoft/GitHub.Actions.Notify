@@ -305,6 +305,30 @@ write_with_retry() {
     local target_pid="$3"
     local deadline=$(($(date +%s) + WRITE_RETRY_SECS))
 
+    # Final guard: refuse to write garbage to the FIFO. The consumer's
+    # `read -r` followed by `jq empty` would otherwise fail and surface
+    # "[wake-on-event] event payload is not valid JSON" to the model.
+    # We re-validate at write time as a belt-and-suspenders check on top
+    # of the producer-side `jq -c .` in process_event_file. This catches
+    # any future code path that constructs $data without going through
+    # process_event_file's jq -c gate.
+    if ! printf '%s' "$data" | jq empty 2>/dev/null; then
+        log "REFUSE to write non-JSON payload to $fifo (length=${#data})"
+        return 1
+    fi
+    # Reject any payload that contains an embedded newline. The consumer
+    # reads ONE NDJSON line per `read -r`, so an embedded newline would
+    # split a single logical event across two reads — the first read
+    # gets a fragment that fails jq parse, and the second read consumes
+    # an unrelated event slot. jq -c would normally have stripped these
+    # already, but we re-check defensively.
+    case "$data" in
+        *$'\n'*)
+            log "REFUSE to write multi-line payload to $fifo (length=${#data})"
+            return 1
+            ;;
+    esac
+
     while [ "$(date +%s)" -lt "$deadline" ]; do
         # Re-check target liveness each iteration.
         if ! is_live_claude "$target_pid"; then
