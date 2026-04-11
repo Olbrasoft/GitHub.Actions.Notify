@@ -92,11 +92,27 @@ LOCKFILE="$WAKE_DIR/.session-${CLAUDE_PID}.reader.lock"
 # left a stale lock, the new spawn detects that via `kill -0` + cmdline
 # re-verification (PID reuse protection) and takes over.
 #
-# Claim is atomic via `set -C` (noclobber) — the kernel guarantees that
-# two concurrent spawns cannot both succeed at creating the same file.
+# Claim is atomic via hard-link: we write our PID to a per-process temp
+# file FIRST, then `ln` it into place as $LOCKFILE. `ln` fails with EEXIST
+# if $LOCKFILE already exists, so at most one spawn can succeed, and any
+# reader that observes $LOCKFILE sees a fully populated PID — never an
+# empty file in the open-but-not-yet-written window that a bare
+# `(set -C; echo > LOCKFILE)` would expose. Addresses the race Copilot
+# flagged on PR #47: the previous noclobber-based claim_lock let a
+# concurrent spawn `cat` the file between open and write, see empty
+# contents, treat it as stale, rm it, and claim its own — two owners
+# and byte-race re-emerged.
 
 claim_lock() {
-    (set -C; echo "$$" > "$LOCKFILE") 2>/dev/null
+    local tmp_lock="${LOCKFILE}.$$.tmp"
+    # Write PID to temp first so the final link target is always populated.
+    printf '%s\n' "$$" > "$tmp_lock" 2>/dev/null || return 1
+    if ln "$tmp_lock" "$LOCKFILE" 2>/dev/null; then
+        rm -f "$tmp_lock"
+        return 0
+    fi
+    rm -f "$tmp_lock"
+    return 1
 }
 
 release_lock() {
@@ -108,6 +124,25 @@ release_lock() {
         rm -f "$LOCKFILE"
     fi
 }
+
+# Defense against a lockfile path that somehow exists but is NOT a regular
+# file (directory, FIFO, symlink to missing target, etc). `rm -f` silently
+# skips directories, which would otherwise make claim_lock fail forever
+# and leave the session with no reader. Log loudly, attempt targeted
+# cleanup (rmdir for an empty dir, rm -f for everything else), and give
+# up only if the path still exists afterwards. Copilot review on PR #47.
+if [ -e "$LOCKFILE" ] && [ ! -f "$LOCKFILE" ]; then
+    echo "[wake-on-event] $LOCKFILE exists but is not a regular file — attempting cleanup" >&2
+    if [ -d "$LOCKFILE" ]; then
+        rmdir "$LOCKFILE" 2>/dev/null
+    else
+        rm -f "$LOCKFILE" 2>/dev/null
+    fi
+    if [ -e "$LOCKFILE" ]; then
+        echo "[wake-on-event] failed to clean up $LOCKFILE — exiting (session will have no reader until the path is fixed manually)" >&2
+        exit 0
+    fi
+fi
 
 if ! claim_lock; then
     # Lock exists — inspect the current owner.
