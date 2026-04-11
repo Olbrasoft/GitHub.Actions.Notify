@@ -75,6 +75,20 @@ PROJECTS_DIR="$HOME/.claude/projects"
 # 60s is enough for the typical Stop→hook spawn latency.
 WRITE_RETRY_SECS="${WAKE_CLAUDE_RETRY_SECS:-60}"
 WRITE_TIMEOUT="${WAKE_CLAUDE_WRITE_TIMEOUT:-3}"
+# Age cutoff for event files. An event file that was DEFER'd (no live
+# consumer at producer time) stays on disk until the UserPromptSubmit
+# fallback hook drains it on the matching session's next prompt. If
+# the target session never prompts again (session died, cwd switched,
+# different repo), the file lingers forever and eventually gets
+# delivered on a completely unrelated wake-claude.sh invocation —
+# exactly what we saw with the PR #46 ci-complete event that sat on
+# disk for 61h30m before being delivered by a push that triggered
+# CI on a different PR. Files older than this threshold are dropped
+# upfront as hopelessly stale. 1h is well past the normal DEFER
+# window (WRITE_RETRY_SECS = 60s) yet still recent enough that a
+# legitimate post-stop drain can catch events that were DEFER'd just
+# before the session went to sleep.
+MAX_EVENT_AGE_SECS="${WAKE_CLAUDE_MAX_EVENT_AGE:-3600}"
 
 ###############################################################################
 # Helpers
@@ -90,11 +104,12 @@ log() { echo "[wake-claude] $*" >&2; }
 sweep_stale_session_files() {
     local f pid
     [ -d "$WAKE_DIR" ] || return 0
-    for f in "$WAKE_DIR"/.session-*.fifo "$WAKE_DIR"/.session-*.json; do
+    for f in "$WAKE_DIR"/.session-*.fifo "$WAKE_DIR"/.session-*.json "$WAKE_DIR"/.session-*.reader.lock; do
         [ -e "$f" ] || continue
         pid="${f##*/.session-}"
         pid="${pid%.fifo}"
         pid="${pid%.json}"
+        pid="${pid%.reader.lock}"
         # Numeric PID check — skip anything that does not match the pattern.
         case "$pid" in
             ''|*[!0-9]*) continue ;;
@@ -106,6 +121,41 @@ sweep_stale_session_files() {
     done
 }
 sweep_stale_session_files
+
+# Sweep event files older than MAX_EVENT_AGE_SECS. Unlike
+# sweep_stale_session_files, this runs for ALL event files in EVENTS_DIR
+# (not just this-repo files), because a long-forgotten event file from
+# any repo can eventually get picked up by a wake-claude.sh call for
+# that repo and delivered as an ancient "wake" hours or days later.
+sweep_stale_event_files() {
+    [ -d "$EVENTS_DIR" ] || return 0
+    local now_epoch ts ts_epoch age
+    now_epoch=$(date -u +%s)
+    for f in "$EVENTS_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        # Prefer the timestamp recorded inside the event — it reflects
+        # when the producer generated the event. Fall back to the file
+        # mtime if the payload is unparseable or has no .timestamp field.
+        ts=""
+        if jq empty "$f" 2>/dev/null; then
+            ts=$(jq -r '.timestamp // ""' "$f" 2>/dev/null)
+        fi
+        ts_epoch=""
+        if [ -n "$ts" ]; then
+            ts_epoch=$(date -u -d "$ts" +%s 2>/dev/null || echo "")
+        fi
+        if [ -z "$ts_epoch" ]; then
+            ts_epoch=$(stat -c %Y "$f" 2>/dev/null || echo "")
+        fi
+        [ -z "$ts_epoch" ] && continue
+        age=$((now_epoch - ts_epoch))
+        if [ "$age" -gt "$MAX_EVENT_AGE_SECS" ]; then
+            log "DROP stale-on-disk (age=${age}s > MAX_EVENT_AGE_SECS=${MAX_EVENT_AGE_SECS}s): ${f##*/}"
+            rm -f "$f"
+        fi
+    done
+}
+sweep_stale_event_files
 
 [ -d "$EVENTS_DIR" ] || exit 0
 
