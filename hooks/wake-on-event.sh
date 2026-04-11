@@ -65,23 +65,89 @@ fi
 
 FIFO="$WAKE_DIR/.session-${CLAUDE_PID}.fifo"
 MANIFEST="$WAKE_DIR/.session-${CLAUDE_PID}.json"
+LOCKFILE="$WAKE_DIR/.session-${CLAUDE_PID}.reader.lock"
 
-# NOTE: there is no singleton check. Multiple wake-on-event.sh instances per
-# session are intentional: Claude Code spawns a new hook on every Stop event,
-# and old instances stay blocked on `cat $FIFO` until either (a) they receive
-# an event and exit 2, or (b) their 600s timeout expires. Multiple readers
-# blocked on the same FIFO are a feature — when wake-claude.sh writes one
-# event, the kernel atomically delivers it to exactly one reader; the others
-# stay alive and act as backup readers for subsequent events. This makes the
-# wake mechanism more resilient to bursts.
+###############################################################################
+# Singleton reader enforcement
+###############################################################################
+#
+# Only ONE wake-on-event.sh instance may block on the FIFO at a time per
+# Claude session. A previous iteration of this script claimed that multiple
+# concurrent readers were "a feature" — that was WRONG.
+#
+# The failure mode: bash's `read -r` builtin reads from its input FD one
+# BYTE at a time (it has to scan for the delimiter byte-by-byte). When two
+# processes block simultaneously in `read -r` on the same FIFO, the kernel
+# delivers one byte of an atomic write to one reader, the next byte to the
+# other, and so on. The result is that each reader ends up with every OTHER
+# byte of the payload — "garbled" NDJSON that fails `jq empty` parse. When
+# the first reader hits a newline and exits, the second inherits the rest
+# of the stream, so its buffer ends up as (every-other-byte of payload A) +
+# (clean payload B). This exact pattern was observed repeatedly in
+# ~/.config/claude-channels/invalid-payloads/*.txt.
+#
+# Fix: a PID-based lockfile ensures at most one reader per CLAUDE_PID.
+# New spawns that find a live reader step aside (exit 0) and leave the
+# existing reader in charge. If the old reader exited ungracefully and
+# left a stale lock, the new spawn detects that via `kill -0` + cmdline
+# re-verification (PID reuse protection) and takes over.
+#
+# Claim is atomic via `set -C` (noclobber) — the kernel guarantees that
+# two concurrent spawns cannot both succeed at creating the same file.
+
+claim_lock() {
+    (set -C; echo "$$" > "$LOCKFILE") 2>/dev/null
+}
+
+release_lock() {
+    # Only release if we still own the lock. Avoids a rm of a lock that
+    # was stolen from us by PID reuse or a rogue overwrite.
+    local owner
+    owner=$(cat "$LOCKFILE" 2>/dev/null)
+    if [ "$owner" = "$$" ]; then
+        rm -f "$LOCKFILE"
+    fi
+}
+
+if ! claim_lock; then
+    # Lock exists — inspect the current owner.
+    old_pid=$(cat "$LOCKFILE" 2>/dev/null)
+    if [ -n "$old_pid" ] && [ "$old_pid" != "$$" ] && kill -0 "$old_pid" 2>/dev/null; then
+        # Owner is alive. Verify it is actually wake-on-event.sh (not a
+        # PID-reuse victim that happens to have the same numeric PID).
+        old_cmdline=$(tr '\0' ' ' < "/proc/$old_pid/cmdline" 2>/dev/null)
+        case "$old_cmdline" in
+            *wake-on-event.sh*)
+                # Another live reader owns the FIFO. Step aside without
+                # touching the FIFO, the manifest, or the lock — the
+                # existing reader is still doing its job.
+                exit 0
+                ;;
+        esac
+    fi
+    # Stale lock (owner is dead, or was never wake-on-event.sh). Drop it
+    # and try once more. If a concurrent spawn beat us, exit without
+    # racing — there is always going to be a live reader either way.
+    rm -f "$LOCKFILE"
+    if ! claim_lock; then
+        exit 0
+    fi
+fi
 
 ###############################################################################
 # Cleanup on real exit (not on exit 2 — Claude Code respawns the hook then)
 ###############################################################################
 
 cleanup() {
-    # Only purge if the parent Claude process is dead. exit 2 keeps the
-    # session alive and we want the FIFO preserved for the next spawn.
+    # Always release the reader lock so the next spawn can claim it.
+    # Without this, after `exit 2` the next Stop-hook spawn would see a
+    # stale lock with our own (dead) PID and there would be no reader
+    # until the PID-reuse protection kicks in.
+    release_lock
+
+    # Only purge FIFO/manifest if the parent Claude process is dead.
+    # exit 2 keeps the session alive and we want the FIFO preserved for
+    # the next spawn.
     if ! kill -0 "$CLAUDE_PID" 2>/dev/null; then
         rm -f "$FIFO" "$MANIFEST"
     fi

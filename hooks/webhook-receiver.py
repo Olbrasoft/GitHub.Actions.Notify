@@ -188,6 +188,27 @@ class WebhookHandler(BaseHTTPRequestHandler):
         pr_url = pr.get("html_url", "")
         head_sha = pr.get("head", {}).get("sha", "unknown")[:7]
 
+        # Stale PR guard — skip review events for PRs that are already merged
+        # or closed. Copilot reviews can arrive minutes after merge (Copilot
+        # analyses the PR in the background, and its review post races with
+        # any fast post-merge action). Waking Claude for a MERGED PR forces
+        # the session to verify + classify as "stale" every time — noise
+        # that this guard eliminates at the producer. See analysis in
+        # ~/.config/claude-channels/wake-feedback.md entries classified
+        # "stale" during 2026-04-08 → 2026-04-11. The pull_request object
+        # in a pull_request_review webhook payload carries the live state
+        # and merged flag, so no extra API call is needed.
+        pr_state = pr.get("state", "open")
+        pr_merged = bool(pr.get("merged"))
+        if pr_merged or pr_state != "open":
+            reason = "merged" if pr_merged else pr_state
+            print(
+                f"[webhook-receiver] SKIP review for {repo_name} PR #{pr_number} "
+                f"(reviewer: {reviewer}): PR is already {reason} — not waking",
+                file=sys.stderr,
+            )
+            return
+
         # Count review comments
         comment_count = 0
         review_id = review.get("id")
