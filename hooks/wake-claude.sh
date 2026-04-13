@@ -517,6 +517,25 @@ process_event_file() {
         # Without this fallback, a wake event arriving while no hook is
         # currently in `read` is silently lost after WRITE_RETRY_SECS.
         log "DEFER ${event_file##*/} → PID $target_pid (PR=${pr_num:-?}) — file kept for UserPromptSubmit fallback"
+
+        # Recovery: if the FIFO write failed because no reader is active,
+        # the reader.lock may be held by a dead process. Clean it up NOW
+        # so the NEXT Stop-hook spawn for this Claude session is not
+        # blocked by a stale lock. Without this, the session goes "deaf"
+        # indefinitely: wake-claude.sh DEFERs, but the next hook spawn
+        # sees a live-looking lock and exits 0, leaving no reader.
+        # Observed in the field on 2026-04-13: PID 11079 (Olbrasoft/cr)
+        # had reader.lock held by dead PID 627450; two events sat on disk
+        # for 15+ minutes with no path to delivery.
+        local reader_lock="$WAKE_DIR/.session-${target_pid}.reader.lock"
+        if [ -f "$reader_lock" ]; then
+            local lock_owner
+            lock_owner=$(cat "$reader_lock" 2>/dev/null)
+            if [ -n "$lock_owner" ] && ! kill -0 "$lock_owner" 2>/dev/null; then
+                log "Cleaning stale reader.lock for PID $target_pid (held by dead $lock_owner)"
+                rm -f "$reader_lock"
+            fi
+        fi
     fi
 }
 

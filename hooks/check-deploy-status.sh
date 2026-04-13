@@ -5,6 +5,54 @@
 # and deletes the file so it's only shown once.
 
 EVENTS_DIR="$HOME/.config/claude-channels/deploy-events"
+WAKE_DIR="/tmp/claude-wake"
+
+###############################################################################
+# Recovery: clean stale reader.lock for this session
+###############################################################################
+#
+# If our session's wake-on-event.sh reader died without releasing its lock
+# (e.g. SIGKILL, OOM), the next Stop-hook spawn will see the stale lock and
+# claim it — but only when a Stop event fires. If the session is idle
+# (waiting for user input or a wake event), NO Stop fires and the session
+# goes "deaf": wake-claude.sh DEFERs events to disk, no reader picks them
+# up, the user sees nothing. By cleaning the stale lock HERE (on every
+# UserPromptSubmit), we ensure the user's NEXT prompt triggers a model
+# response → Stop → new reader spawn → FIFO comes back to life.
+#
+# This is the last line of defense against the deadlock:
+#   user waits for wake → reader is dead → wake DEFERs → user keeps waiting
+# By running on UserPromptSubmit (which fires when the user breaks the
+# deadlock by typing anything), we restore the reader pipeline.
+
+_find_claude_pid() {
+    local pid=$PPID i=0
+    while [ "$pid" -gt 1 ] && [ "$i" -lt 10 ]; do
+        local comm
+        comm=$(cat "/proc/$pid/comm" 2>/dev/null) || break
+        if [ "$comm" = "claude" ]; then
+            echo "$pid"
+            return 0
+        fi
+        pid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null) || break
+        i=$((i + 1))
+    done
+}
+
+_clean_stale_reader_lock() {
+    local cpid lock_file lock_owner
+    cpid=$(_find_claude_pid)
+    [ -z "$cpid" ] && return 0
+    lock_file="$WAKE_DIR/.session-${cpid}.reader.lock"
+    [ -f "$lock_file" ] || return 0
+    lock_owner=$(cat "$lock_file" 2>/dev/null)
+    [ -z "$lock_owner" ] && return 0
+    if ! kill -0 "$lock_owner" 2>/dev/null; then
+        rm -f "$lock_file"
+        echo "[check-deploy-status] Cleaned stale reader.lock for session PID $cpid (was held by dead PID $lock_owner)" >&2
+    fi
+}
+_clean_stale_reader_lock
 
 # Check if directory exists
 if [ ! -d "$EVENTS_DIR" ]; then

@@ -187,7 +187,12 @@ cleanup() {
         rm -f "$FIFO" "$MANIFEST"
     fi
 }
-trap cleanup EXIT
+# Trap EXIT for normal exits AND trappable signals. SIGKILL (kill -9)
+# cannot be trapped — that is the ONE case where a stale lock survives.
+# All other common termination signals (SIGTERM from systemd-user or
+# Claude Code cleanup, SIGHUP from terminal close, SIGINT from Ctrl-C)
+# now trigger lock release, greatly reducing stale-lock occurrences.
+trap cleanup EXIT SIGTERM SIGHUP SIGINT
 
 ###############################################################################
 # Create FIFO + manifest if missing (idempotent across hook spawns)
