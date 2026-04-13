@@ -187,7 +187,18 @@ cleanup() {
         rm -f "$FIFO" "$MANIFEST"
     fi
 }
+# EXIT trap for normal exits (exit 0, exit 2).
 trap cleanup EXIT
+# Signal traps for SIGTERM/SIGHUP/SIGINT must explicitly exit after
+# cleanup. In bash, trapping a signal REPLACES the default termination
+# behavior — without the explicit `exit`, the script would continue its
+# FIFO read loop WITHOUT holding the lock (cleanup released it),
+# potentially allowing a concurrent reader and breaking the singleton
+# guarantee. Copilot review on PR #48.
+# The EXIT trap also fires when we `exit 0` here, calling cleanup a
+# second time — this is safe because release_lock is idempotent (it
+# re-reads the lockfile and only removes it if we still own it).
+trap 'cleanup; exit 0' SIGTERM SIGHUP SIGINT
 
 ###############################################################################
 # Create FIFO + manifest if missing (idempotent across hook spawns)
