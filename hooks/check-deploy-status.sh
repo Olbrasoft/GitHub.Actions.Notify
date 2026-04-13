@@ -40,16 +40,25 @@ _find_claude_pid() {
 }
 
 _clean_stale_reader_lock() {
-    local cpid lock_file lock_owner
+    local cpid lock_file lock_owner current_lock_owner
     cpid=$(_find_claude_pid)
     [ -z "$cpid" ] && return 0
     lock_file="$WAKE_DIR/.session-${cpid}.reader.lock"
     [ -f "$lock_file" ] || return 0
     lock_owner=$(cat "$lock_file" 2>/dev/null)
     [ -z "$lock_owner" ] && return 0
+    # Numeric PID validation — skip corrupt content.
+    case "$lock_owner" in ''|*[!0-9]*) return 0 ;; esac
     if ! kill -0 "$lock_owner" 2>/dev/null; then
-        rm -f "$lock_file"
-        echo "[check-deploy-status] Cleaned stale reader.lock for session PID $cpid (was held by dead PID $lock_owner)" >&2
+        # TOCTOU guard: re-read the lock before deleting. Between our
+        # first read and now, a new wake-on-event.sh could have removed
+        # the stale lock and claimed a new one. Deleting the NEW lock
+        # would break the singleton guarantee. Copilot review on PR #48.
+        current_lock_owner=$(cat "$lock_file" 2>/dev/null) || return 0
+        if [ "$current_lock_owner" = "$lock_owner" ]; then
+            rm -f "$lock_file"
+            echo "[check-deploy-status] Cleaned stale reader.lock for session PID $cpid (was held by dead PID $lock_owner)" >&2
+        fi
     fi
 }
 _clean_stale_reader_lock

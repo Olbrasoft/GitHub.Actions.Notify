@@ -531,9 +531,22 @@ process_event_file() {
         if [ -f "$reader_lock" ]; then
             local lock_owner
             lock_owner=$(cat "$reader_lock" 2>/dev/null)
+            # Numeric PID validation — skip non-numeric content (corrupt lock).
+            case "$lock_owner" in ''|*[!0-9]*) lock_owner="" ;; esac
             if [ -n "$lock_owner" ] && ! kill -0 "$lock_owner" 2>/dev/null; then
-                log "Cleaning stale reader.lock for PID $target_pid (held by dead $lock_owner)"
-                rm -f "$reader_lock"
+                # TOCTOU guard: re-read the lock before deleting. Between
+                # our first read and now, a new wake-on-event.sh could have
+                # removed the stale lock and claimed a new one. Deleting
+                # the NEW lock would re-open concurrent readers.
+                # Copilot review on PR #48.
+                local current_lock_owner
+                current_lock_owner=$(cat "$reader_lock" 2>/dev/null)
+                if [ "$current_lock_owner" = "$lock_owner" ]; then
+                    log "Cleaning stale reader.lock for PID $target_pid (held by dead $lock_owner)"
+                    rm -f "$reader_lock"
+                else
+                    log "Skip stale reader.lock cleanup for PID $target_pid; lock changed during validation"
+                fi
             fi
         fi
     fi
