@@ -133,12 +133,23 @@ def _wake(repo_name, branch=None):
         args = [wake_script, repo_name]
         if branch:
             args.append(branch)
-        # Use DEVNULL for stderr — nothing reads the pipe in this process, so
-        # PIPE would let the kernel buffer fill up and eventually block the
-        # child or leak file descriptors over time. wake-claude.sh's own
-        # stderr is preserved by the systemd journal of gh-webhook-forward.service
-        # if we ever need to debug it; for that, run wake-claude.sh manually.
-        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # IMPORTANT: stderr is INHERITED (None), not redirected to DEVNULL.
+        # wake-claude.sh emits diagnostic lines for every event it
+        # processes — DELIVERED, DEFER, DROP (stale-on-disk, ambiguous
+        # session, merged PR, etc.). When stderr was DEVNULL, all of
+        # those lines were lost to the void: the journal showed
+        # webhook-receiver saying "Wake signal sent" but no record of
+        # what wake-claude.sh actually DID with the signal. Observed
+        # 2026-04-15 23:02-23:17 on Olbrasoft/cr PR #434: 2 wake signals
+        # sent, session never woke, no clue why. Inheriting stderr lets
+        # wake-claude.sh log to the same systemd journal as the
+        # receiver, so post-incident debugging starts from grep.
+        # PIPE would risk kernel buffer fill / fd leak; None (inherit)
+        # writes straight through to the journal with zero buffering.
+        # stderr=None is explicit (not relying on the implicit default)
+        # so a future edit cannot silently reintroduce DEVNULL by setting
+        # only stdout. Copilot review on PR #51.
+        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=None)
         # Reap the child in a background thread so it does not become a
         # zombie. wake-claude.sh can take up to WAKE_CLAUDE_RETRY_SECS to
         # finish; we never want to block the receiver waiting for it.
