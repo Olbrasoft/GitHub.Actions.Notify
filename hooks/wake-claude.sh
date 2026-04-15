@@ -455,6 +455,41 @@ process_event_file() {
         fi
     fi
 
+    # Delivery-side stale-PR guard. An event that was valid at producer
+    # time can become stale before we actually deliver it:
+    #   - Producer wrote event at T=0 while PR was OPEN.
+    #   - wake-claude.sh DEFER'd it (no reader on FIFO at T=0).
+    #   - User merged the PR at T=2m.
+    #   - At T=5m a new wake-claude.sh invocation for the same repo picks
+    #     up the DEFER'd file and tries to deliver — but the PR is now
+    #     MERGED and delivering produces pure noise (the consumer will
+    #     verify state, classify as stale, log a feedback entry, and
+    #     move on).
+    # Dropping here instead of delivering eliminates that noise.
+    # Producer-side (webhook-receiver.py) already guards against the
+    # already-merged case at event CREATION time; this is the paired
+    # guard at event DELIVERY time. Observed 2026-04-15 on Olbrasoft/cr:
+    # 4 back-to-back stale ci-complete events (PRs #427, #429 ×2, #431,
+    # VA#943) all fired for PRs that were merged between event creation
+    # and session consumption.
+    if [ -n "$pr_num" ]; then
+        local pr_state_json pr_state pr_merged
+        pr_state_json=$(timeout 10 gh pr view "$pr_num" --repo "$REPO_FULL" --json state,mergedAt 2>/dev/null)
+        if [ -n "$pr_state_json" ]; then
+            pr_state=$(echo "$pr_state_json" | jq -r '.state // ""')
+            pr_merged=$(echo "$pr_state_json" | jq -r 'if .mergedAt then "true" else "false" end')
+            if [ "$pr_merged" = "true" ] || { [ -n "$pr_state" ] && [ "$pr_state" != "OPEN" ]; }; then
+                local reason="$pr_state"
+                [ "$pr_merged" = "true" ] && reason="MERGED"
+                log "DROP ${event_file##*/} — PR #$pr_num is already $reason (stale at delivery, not waking)"
+                rm -f "$event_file"
+                return
+            fi
+        fi
+        # If the gh call failed (network, auth, rate limit), fall through
+        # and deliver anyway — better a noisy wake than a lost one.
+    fi
+
     # Find target PID — PRIMARY: session UUID from PR body marker
     #                  FALLBACK: strict cwd matching (exactly one Claude on repo)
     local target_pid=""
