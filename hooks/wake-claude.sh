@@ -488,8 +488,9 @@ process_event_file() {
         return
     fi
 
-    # Extract optional PR number from event
-    local pr_num
+    # Extract event type and optional PR number
+    local event_type pr_num
+    event_type=$(echo "$event_data" | jq -r '.event // empty')
     pr_num=$(echo "$event_data" | jq -r '.prNumber // empty')
 
     if [ -z "$pr_num" ]; then
@@ -502,6 +503,25 @@ process_event_file() {
             case "$pr_num" in ''|*[!0-9]*) pr_num="" ;; esac
         fi
     fi
+
+    # Delivery-side stale-PR guard applies ONLY to pre-merge events
+    # (ci-complete, code-review-complete). Post-merge events
+    # (deploy-complete, verify-complete) run BY DESIGN after a merge;
+    # for them, "PR is merged" is the expected state, not staleness.
+    # Applying the merged-PR check to a deploy-complete event for the
+    # PR's merge commit wrongly drops legitimate deploy notifications —
+    # observed 2026-04-15 on Olbrasoft/VirtualAssistant PR #945:
+    # deploy workflow ran successfully on d0f3b01 (merge commit),
+    # wrote the event file, then wake-claude.sh derived pr_num=945
+    # from the merge commit, saw "PR #945 MERGED", and DROPped the
+    # event — leaving the session indefinitely waiting for a deploy
+    # wake that never arrived. Regression introduced by the guard in
+    # PR #49, fixed here by scoping the guard to pre-merge event
+    # types only.
+    local guard_event=0
+    case "$event_type" in
+        ci-complete|code-review-complete) guard_event=1 ;;
+    esac
 
     # Delivery-side stale-PR guard. An event that was valid at producer
     # time can become stale before we actually deliver it:
@@ -520,7 +540,7 @@ process_event_file() {
     # 4 back-to-back stale ci-complete events (PRs #427, #429 ×2, #431,
     # VA#943) all fired for PRs that were merged between event creation
     # and session consumption.
-    if [ -n "$pr_num" ]; then
+    if [ "$guard_event" = "1" ] && [ -n "$pr_num" ]; then
         # Call directly (NOT in $(...)) so cache mutations persist —
         # result is in $PR_STATE_RESULT. Format is "STATE|MERGED" or
         # "|" on API failure. Fail-open: deliver anyway rather than risk
