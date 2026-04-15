@@ -96,6 +96,54 @@ MAX_EVENT_AGE_SECS="${WAKE_CLAUDE_MAX_EVENT_AGE:-3600}"
 
 log() { echo "[wake-claude] $*" >&2; }
 
+# Per-invocation cache of PR state/merged lookups. A single wake-claude.sh
+# run can process multiple event files for the SAME PR (batched pushes,
+# multi-event repos on busy days). Without the cache, the delivery-side
+# stale-PR guard would run `gh pr view` once per file, producing
+# redundant API calls and extra rate-limit pressure. Cached value
+# format: "<STATE>|<MERGED_BOOL>" (e.g. "OPEN|false" or "MERGED|true").
+# Cache entries persist only for the duration of this script run — the
+# next invocation re-fetches, so a PR merged since last run is picked
+# up promptly. Copilot review on PR #49.
+declare -A PR_STATE_CACHE
+PR_STATE_RESULT=""
+
+# Query PR state once per pr_num. Populates PR_STATE_CACHE[pr_num] and
+# sets the global PR_STATE_RESULT to "<STATE>|<MERGED_BOOL>" (or "|" on
+# API error; empty when pr_num itself is empty).
+#
+# IMPORTANT: we do NOT return the value via stdout. Command substitution
+# (`$(pr_state_cached ...)`) runs the function in a SUBSHELL, and any
+# updates to PR_STATE_CACHE inside the subshell are discarded on exit —
+# the cache never persists and every call re-runs `gh pr view`.
+# Caching must happen in the caller's shell, so we mutate the parent
+# shell via PR_STATE_RESULT and the associative array by calling the
+# function directly (no `$(...)` wrapping). Found during isolated
+# 5-event caching test post-Copilot-review on PR #49.
+pr_state_cached() {
+    local pn="$1"
+    PR_STATE_RESULT=""
+    [ -z "$pn" ] && return 0
+    if [ -n "${PR_STATE_CACHE[$pn]:-}" ]; then
+        PR_STATE_RESULT="${PR_STATE_CACHE[$pn]}"
+        return 0
+    fi
+    local json state merged
+    json=$(timeout 10 gh pr view "$pn" --repo "$REPO_FULL" --json state,mergedAt 2>/dev/null)
+    if [ -z "$json" ]; then
+        # Cache the failure too (as "|") so a second event file for the
+        # same PR does not re-try — failure is usually auth/rate-limit,
+        # and retrying in-loop just piles up more failures.
+        PR_STATE_CACHE[$pn]="|"
+        PR_STATE_RESULT="|"
+        return 0
+    fi
+    state=$(echo "$json" | jq -r '.state // ""')
+    merged=$(echo "$json" | jq -r 'if .mergedAt then "true" else "false" end')
+    PR_STATE_CACHE[$pn]="$state|$merged"
+    PR_STATE_RESULT="$state|$merged"
+}
+
 # Sweep stale per-session FIFOs and manifests for dead Claude PIDs.
 # Defined and called BEFORE the EVENTS_DIR existence check (#36 follow-up
 # from Copilot review on PR #38) so that the sweep runs even when there
@@ -473,11 +521,16 @@ process_event_file() {
     # VA#943) all fired for PRs that were merged between event creation
     # and session consumption.
     if [ -n "$pr_num" ]; then
-        local pr_state_json pr_state pr_merged
-        pr_state_json=$(timeout 10 gh pr view "$pr_num" --repo "$REPO_FULL" --json state,mergedAt 2>/dev/null)
-        if [ -n "$pr_state_json" ]; then
-            pr_state=$(echo "$pr_state_json" | jq -r '.state // ""')
-            pr_merged=$(echo "$pr_state_json" | jq -r 'if .mergedAt then "true" else "false" end')
+        # Call directly (NOT in $(...)) so cache mutations persist —
+        # result is in $PR_STATE_RESULT. Format is "STATE|MERGED" or
+        # "|" on API failure. Fail-open: deliver anyway rather than risk
+        # losing a legitimate wake.
+        pr_state_cached "$pr_num"
+        local combined="$PR_STATE_RESULT"
+        if [ -n "$combined" ] && [ "$combined" != "|" ]; then
+            local pr_state pr_merged
+            pr_state="${combined%%|*}"
+            pr_merged="${combined##*|}"
             if [ "$pr_merged" = "true" ] || { [ -n "$pr_state" ] && [ "$pr_state" != "OPEN" ]; }; then
                 local reason="$pr_state"
                 [ "$pr_merged" = "true" ] && reason="MERGED"
@@ -486,8 +539,6 @@ process_event_file() {
                 return
             fi
         fi
-        # If the gh call failed (network, auth, rate limit), fall through
-        # and deliver anyway — better a noisy wake than a lost one.
     fi
 
     # Find target PID — PRIMARY: session UUID from PR body marker

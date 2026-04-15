@@ -297,8 +297,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
         # to wait for, OR there may still be checks in progress.
         agg = self._aggregate_pr_checks(repo_name, pr_number)
         if agg is None:
-            print(f"[webhook-receiver] PR #{pr_number}: gh pr view --json statusCheckRollup "
-                  f"failed, skipping wake",
+            print(f"[webhook-receiver] PR #{pr_number}: gh pr view "
+                  f"(statusCheckRollup,state,mergedAt) failed, skipping wake",
                   file=sys.stderr)
             return
 
