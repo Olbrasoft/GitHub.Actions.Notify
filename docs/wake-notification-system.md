@@ -46,9 +46,12 @@ GitHub
                             ├─► success → DELIVERED, rm event file
                             └─► timeout → DEFER (file kept), clean stale reader.lock
                                   │
-                                  └─► next reader on next Stop / next user prompt
-                                        will pick it up via UserPromptSubmit drain
-                                        (check-deploy-status.sh)
+                                  └─► next user prompt triggers
+                                        UserPromptSubmit drain of the on-disk
+                                        event file (check-deploy-status.sh).
+                                        The FIFO reader is NOT involved in
+                                        this fallback path — it only matters
+                                        for immediate FIFO delivery.
 ```
 
 ---
