@@ -297,9 +297,32 @@ class WebhookHandler(BaseHTTPRequestHandler):
         # to wait for, OR there may still be checks in progress.
         agg = self._aggregate_pr_checks(repo_name, pr_number)
         if agg is None:
-            print(f"[webhook-receiver] PR #{pr_number}: gh pr view --json statusCheckRollup "
-                  f"failed, skipping wake",
+            print(f"[webhook-receiver] PR #{pr_number}: gh pr view "
+                  f"(statusCheckRollup,state,mergedAt) failed, skipping wake",
                   file=sys.stderr)
+            return
+
+        # Stale-PR guard — skip CI events for PRs that are already merged
+        # or closed. GitHub re-fires check_suite events during the final
+        # merge handshake, and GitHub Actions runners can complete minutes
+        # after a PR was squash-merged with a different head SHA. Waking
+        # Claude for a MERGED PR forces every session to verify state and
+        # classify as "stale", exactly the noise this guard eliminates.
+        # Observed 2026-04-15 19:45 on Olbrasoft/cr: 4 back-to-back stale
+        # ci-complete events for PRs #427, #429 (duplicate), #431,
+        # VA#943 — all already merged at event arrival. PR #47 shipped
+        # the same guard for pull_request_review but missed check_suite;
+        # this commit closes that gap.
+        pr_state = (agg.get("state") or "open").lower()
+        pr_merged = bool(agg.get("merged"))
+        if pr_merged or pr_state != "open":
+            reason = "merged" if pr_merged else pr_state
+            print(
+                f"[webhook-receiver] SKIP check_suite for {repo_name} "
+                f"PR #{pr_number} ({head_sha_short}): PR is already "
+                f"{reason} — not waking",
+                file=sys.stderr,
+            )
             return
 
         if not agg["all_terminal"]:
@@ -384,7 +407,9 @@ class WebhookHandler(BaseHTTPRequestHandler):
         _wake(repo_name, pr_branch)
 
     def _aggregate_pr_checks(self, repo_name, pr_number):
-        """Query `gh pr view --json statusCheckRollup` for the aggregate status of all checks on a PR.
+        """Query `gh pr view` for the aggregate check status AND the PR's
+        merged/state flags. Both are fetched in one call so the stale-PR
+        guard does not add an extra API round-trip.
 
         Returns a dict with keys:
           all_terminal (bool): True if every check is in a terminal state
@@ -393,18 +418,22 @@ class WebhookHandler(BaseHTTPRequestHandler):
           success  (int): count of SUCCESS checks
           failure  (int): count of FAILURE checks
           skipped  (int): count of SKIPPED checks
+          state    (str): PR state — "OPEN" / "CLOSED" / "MERGED"
+          merged   (bool): whether the PR was merged
         Returns None on gh CLI error.
         """
         try:
             result = subprocess.run(
                 ["gh", "pr", "view", str(pr_number), "--repo", repo_name,
-                 "--json", "statusCheckRollup"],
+                 "--json", "statusCheckRollup,state,mergedAt"],
                 capture_output=True, text=True, timeout=10
             )
             if result.returncode != 0:
                 return None
             data = json.loads(result.stdout)
             checks = data.get("statusCheckRollup", []) or []
+            pr_state = data.get("state") or ""
+            pr_merged = bool(data.get("mergedAt"))
         except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
             return None
 
@@ -444,6 +473,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
             "success": success,
             "failure": failure,
             "skipped": skipped,
+            "state": pr_state,
+            "merged": pr_merged,
         }
 
     def log_message(self, format, *args):
