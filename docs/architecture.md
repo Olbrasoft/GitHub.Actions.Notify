@@ -1,5 +1,11 @@
 # Architecture
 
+> **For debugging "why didn't the wake event arrive" / "why did six arrive":**
+> read [`wake-notification-system.md`](./wake-notification-system.md) FIRST.
+> It has the failure-mode catalogue, exact `journalctl` recipes, and the
+> known-limitations list. This file describes design intent; that file
+> describes what actually happens and how to fix it.
+
 ## Use case
 
 A Claude Code session implements a feature end-to-end:
