@@ -146,7 +146,10 @@ def _wake(repo_name, branch=None):
         # receiver, so post-incident debugging starts from grep.
         # PIPE would risk kernel buffer fill / fd leak; None (inherit)
         # writes straight through to the journal with zero buffering.
-        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL)
+        # stderr=None is explicit (not relying on the implicit default)
+        # so a future edit cannot silently reintroduce DEVNULL by setting
+        # only stdout. Copilot review on PR #51.
+        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=None)
         # Reap the child in a background thread so it does not become a
         # zombie. wake-claude.sh can take up to WAKE_CLAUDE_RETRY_SECS to
         # finish; we never want to block the receiver waiting for it.
