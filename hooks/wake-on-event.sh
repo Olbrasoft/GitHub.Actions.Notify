@@ -498,7 +498,7 @@ process_event() {
 }
 
 ###############################################################################
-# Startup drain: process DEFER'd events from disk before blocking on FIFO
+# Disk drain: process DEFER'd events from disk
 ###############################################################################
 #
 # When wake-claude.sh cannot deliver via FIFO (session is busy processing
@@ -515,27 +515,53 @@ process_event() {
 #   4. New hook blocks on FIFO — but the review event is on DISK, not in FIFO
 #   5. Session waits forever for a FIFO event that will never come
 #
-# Fix: on every hook startup, check disk FIRST. If a pending event exists
-# for this repo, process it immediately and exit 2 (wake the session).
-# The FIFO is NOT opened during the drain to prevent a race where
-# wake-claude.sh writes to the FIFO (seeing a reader), but the data is
-# never consumed (we exit 2 for the disk event instead).
+# Fix: drain_pending_events() is called on startup (before FIFO open) and
+# on every FIFO read timeout (loop drain). If a pending event exists for
+# this repo, process it immediately and exit 2 (wake the session).
+#
+# Note: event files are matched by repo prefix, not by target Claude PID.
+# This is consistent with check-deploy-status.sh. If two sessions exist for
+# the same repo, whichever drains first gets the event. In practice this is
+# rare because R4 (strict count==1 matching) prevents wake-claude.sh from
+# targeting ambiguous sessions. A future improvement could encode the target
+# PID into the DEFER'd filename for precise routing.
 
-EVENTS_DIR="${HOME}/.config/claude-channels/deploy-events"
+# Safe HOME/XDG resolution matching INVALID_PAYLOADS_DIR pattern — the
+# script runs under set -u, so bare $HOME aborts when HOME is unset.
+EVENTS_DIR=""
+if [ -n "${XDG_CONFIG_HOME:-}" ]; then
+    EVENTS_DIR="$XDG_CONFIG_HOME/claude-channels/deploy-events"
+elif [ -n "${HOME:-}" ]; then
+    EVENTS_DIR="${HOME}/.config/claude-channels/deploy-events"
+fi
 REPO_PREFIX=$(git remote get-url origin 2>/dev/null | sed 's|.*github.com[:/]||;s|\.git$||' | tr '/' '-')
 
-if [ -n "$REPO_PREFIX" ] && [ -d "$EVENTS_DIR" ]; then
+# Shared drain logic used by both startup drain and loop drain.
+# Returns 0 without exiting if no events found; calls exit 2 if an event
+# was processed (never returns in that case).
+drain_pending_events() {
+    local origin="$1"
+    [ -n "$REPO_PREFIX" ] || return 0
+    [ -n "$EVENTS_DIR" ] || return 0
+    [ -d "$EVENTS_DIR" ] || return 0
+    local event_file event_data
     for event_file in "$EVENTS_DIR"/${REPO_PREFIX}*.json; do
         [ -f "$event_file" ] || continue
         event_data=$(cat "$event_file" 2>/dev/null)
         rm -f "$event_file"
         if [ -n "$event_data" ]; then
-            echo "[wake-on-event] Startup drain: processing DEFER'd event: $(basename "$event_file")" >&2
+            echo "[wake-on-event] $origin: processing DEFER'd event: $(basename "$event_file")" >&2
             process_event "$event_data"
             exit 2
         fi
     done
-fi
+}
+
+# Startup drain: check disk FIRST, before opening the FIFO. The FIFO is
+# NOT opened during drain to prevent a race where wake-claude.sh writes to
+# the FIFO (seeing a reader), but the data is never consumed (we exit 2
+# for the disk event instead).
+drain_pending_events "Startup drain"
 
 ###############################################################################
 # Main loop: block on FIFO
@@ -593,27 +619,11 @@ while true; do
         exit 2
     fi
 
-    ###########################################################################
-    # Loop drain: check disk for DEFER'd events on every FIFO timeout
-    ###########################################################################
-    #
-    # Same logic as startup drain but runs periodically while the hook is
-    # alive. Catches events that were DEFER'd by wake-claude.sh when this
-    # hook's FIFO had no reader (e.g. during a previous tool-execution gap
-    # that caused the prior hook instance to exit 2 for a different event).
-    if [ -n "$REPO_PREFIX" ] && [ -d "$EVENTS_DIR" ]; then
-        for event_file in "$EVENTS_DIR"/${REPO_PREFIX}*.json; do
-            [ -f "$event_file" ] || continue
-            event_data=$(cat "$event_file" 2>/dev/null)
-            rm -f "$event_file"
-            if [ -n "$event_data" ]; then
-                echo "[wake-on-event] Loop drain: processing DEFER'd event: $(basename "$event_file")" >&2
-                process_event "$event_data"
-                exec 3<&-
-                exit 2
-            fi
-        done
-    fi
+    # Loop drain: check disk for DEFER'd events on every FIFO timeout.
+    # Uses the same drain_pending_events() helper as the startup path.
+    # If an event is found, drain_pending_events calls exit 2 internally
+    # (FD 3 is cleaned up by the EXIT trap via cleanup).
+    drain_pending_events "Loop drain"
 
     # Refresh manifest with current cwd (cheap) and loop back.
     jq -n \
