@@ -97,11 +97,14 @@ Wake happens within seconds of the GitHub event, while the session is still aliv
 │ │     Claude PID (multiple readers cause kernel-level         │     │
 │ │     event stealing)                                         │     │
 │ │  4. mkfifo /tmp/claude-wake/.session-{PID}.fifo             │     │
-│ │  5. cat $FIFO   ← blocks at zero CPU                        │     │
-│ │  6. On read: parse event, output instructions to stderr,    │     │
+│ │  5. STARTUP DRAIN: check disk for DEFER'd events first      │     │
+│ │     → if found, process + exit 2 (skip FIFO entirely)       │     │
+│ │  6. read $FIFO (120s timeout) ← blocks at zero CPU          │     │
+│ │  7. On timeout: LOOP DRAIN — check disk for DEFER'd events  │     │
+│ │  8. On read: parse event, output instructions to stderr,    │     │
 │ │     exit 2 → Claude Code re-prompts assistant with stderr   │     │
 │ │     as a system reminder (this IS the "wake")               │     │
-│ │  7. On real exit (Claude session dies): cleanup trap        │     │
+│ │  9. On real exit (Claude session dies): cleanup trap        │     │
 │ │     removes FIFO and manifest                               │     │
 │ └─────────────────────────────────────────────────────────────┘     │
 └──────────────────────────────────────────────────────────────────────┘

@@ -11,11 +11,26 @@ This runbook exists because sessions repeatedly got stuck in one of these loops:
 
 ## What changed (2026-04-16)
 
+### Prescriptive wake instructions (PR #53)
+
 The wake event instructions injected by `wake-on-event.sh` have been rewritten to be **prescriptive, not advisory.** Previously, the ci-complete instructions said "check if comments already addressed" — sessions debated endlessly instead of merging. Now the instructions are a decision procedure:
 
 1. Run ONE command (`gh pr view` with specific jq)
 2. Match the FIRST applicable rule (no deliberation)
 3. Act (MERGE / WAIT / SKIP)
+
+### Startup drain + loop drain (PR #54)
+
+**The recurring deadlock was:** two events arrive close together (e.g., CI complete at 14:53, Copilot review at 14:54). The first event is delivered via FIFO. The second event arrives while the session is processing the first one (no FIFO reader available) → DEFER'd to disk. Previously, the disk file was only drained on `UserPromptSubmit` (user types something), which **never fires in autonomous mode** → session waits forever.
+
+**Fix:** `wake-on-event.sh` now has THREE delivery paths:
+1. **Startup drain** — on every hook spawn, check disk for pending events BEFORE blocking on FIFO
+2. **FIFO delivery** — instant wake via named pipe (primary path, unchanged)
+3. **Loop drain** — every 120s FIFO timeout, check disk for DEFER'd events
+
+The `check-deploy-status.sh` on UserPromptSubmit is now a tertiary fallback.
+
+### Reference
 
 The `ci-workflow-monitor` skill in `skills/ci-workflow-monitor/SKILL.md` has the full state machine (Phase A/B/C) and Critical Rule #7 about Copilot reviewing once. **Re-read the skill file** (`cat ~/Olbrasoft/GitHub.Actions.Notify/skills/ci-workflow-monitor/SKILL.md`) if you're unsure about the lifecycle.
 
@@ -185,6 +200,8 @@ ls -la ~/.config/claude-channels/deploy-events/
 | Wait for post-merge CI | Session hangs forever | Rule 3: main CI doesn't trigger wake |
 | Receive CI success but don't merge | Session sits idle | MERGE DECISION table: checks_pass + copilot reviewed → MERGE |
 | Receive CI failure but wait | Session sits idle | Fix immediately, don't wait for another wake |
+| Two events arrive close together | Second event DEFER'd, session waits forever | Startup drain + loop drain (PR #54): hook checks disk on spawn and every 120s |
+| Hook dies, session goes deaf | No reader, all events DEFER to disk | Startup drain on next hook spawn; if hook never spawns, user must type to trigger UserPromptSubmit fallback |
 
 ---
 
