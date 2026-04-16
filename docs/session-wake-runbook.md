@@ -211,4 +211,8 @@ ls -la ~/.config/claude-channels/deploy-events/
 - For system-level architecture and failure modes: see `docs/wake-notification-system.md`
 - For the hook code itself: `hooks/` directory
 
+## Testing the wake system
+
+To verify the wake system works end-to-end, create a PR, go idle, and confirm the session is woken by the event — not by polling or user input. The session must be truly idle (at the prompt) when the event arrives.
+
 **Update this file when you discover a new "session got stuck" pattern.** Add it to the common mistakes table with the prevention rule.
