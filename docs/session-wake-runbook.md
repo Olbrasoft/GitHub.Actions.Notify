@@ -213,6 +213,9 @@ ls -la ~/.config/claude-channels/deploy-events/
 
 ## Testing the wake system
 
-To verify the wake system works end-to-end, create a PR, go idle, and confirm the session is woken by the event — not by polling or user input. The session must be truly idle (at the prompt) when the event arrives.
+To verify the wake system works end-to-end, create a PR, go idle, and confirm the session is woken by the async wake path rather than by manual input / `UserPromptSubmit` fallback. A correct wake arrives via either the direct FIFO path (immediate) or the startup/loop drain (DEFER'd event picked up within seconds to 120s). The session must be truly idle (at the prompt) when the event arrives. Check the wake log prefix to tell which path fired:
+- `[wake-on-event] Startup drain:` — event was DEFER'd, picked up on hook spawn
+- `[wake-on-event] Loop drain:` — event was DEFER'd, picked up on 120s timeout
+- No prefix — direct FIFO delivery (fastest path)
 
 **Update this file when you discover a new "session got stuck" pattern.** Add it to the common mistakes table with the prevention rule.
