@@ -46,12 +46,15 @@ GitHub
                             ├─► success → DELIVERED, rm event file
                             └─► timeout → DEFER (file kept), clean stale reader.lock
                                   │
-                                  └─► next user prompt triggers
-                                        UserPromptSubmit drain of the on-disk
-                                        event file (check-deploy-status.sh).
-                                        The FIFO reader is NOT involved in
-                                        this fallback path — it only matters
-                                        for immediate FIFO delivery.
+                                  ├─► PRIMARY: next wake-on-event.sh spawn
+                                  │     does startup drain (reads event from
+                                  │     disk before blocking on FIFO)
+                                  ├─► SECONDARY: loop drain every 120s while
+                                  │     hook is alive (FIFO read timeout →
+                                  │     check disk → process if found)
+                                  └─► TERTIARY: UserPromptSubmit drain
+                                        (check-deploy-status.sh) on next
+                                        user prompt — last resort
 ```
 
 ---
@@ -62,8 +65,8 @@ GitHub
 |---|---|---|
 | `webhook-receiver.py` | HTTP listener on :9877. Parses GitHub webhooks. Writes event files. Spawns wake-claude.sh. | Long-running systemd service |
 | `wake-claude.sh` | One-shot delivery transaction. Finds target session, writes to FIFO. | Spawned per event, exits when done |
-| `wake-on-event.sh` | asyncRewake hook in each Claude session. Blocks on FIFO. On read → exit 2 → injection. | Spawned by Claude Code on SessionStart and Stop |
-| `check-deploy-status.sh` | UserPromptSubmit hook. Drains pending event files on disk. Cleans stale reader.lock. | Runs on every user prompt |
+| `wake-on-event.sh` | asyncRewake hook in each Claude session. Startup drain (disk) → FIFO block (120s timeout) → loop drain (disk). On event → exit 2 → injection. | Spawned by Claude Code on SessionStart and Stop |
+| `check-deploy-status.sh` | UserPromptSubmit hook. Drains pending event files on disk. Cleans stale reader.lock. Tertiary fallback. | Runs on every user prompt |
 | `log-wake-feedback.sh` | Records session's classification (ok/late/stale/garbled/...) of received events to wake-feedback.md | Called explicitly from session after acting on a wake |
 | `start-webhook-forwards.sh` | systemd service entrypoint. Runs `gh webhook forward` for each configured repo + the receiver. | Long-running |
 
@@ -152,6 +155,7 @@ The event was never produced. Two sub-cases:
 | Stale event delivered after producer was correct | DEFER'd file delivered post-merge as stale wake | PR #49 | Delivery-side merged-PR guard in wake-claude.sh |
 | Deploy event dropped because PR is merged | session waited for deploy that was silently dropped | PR #50 | Guard scoped to ci-complete/code-review-complete only |
 | wake-claude.sh decisions invisible | journal showed "Wake signal sent" but no result | PR #51 | webhook-receiver inherits stderr instead of DEVNULL |
+| DEFER'd event never picked up (autonomous deadlock) | Session stuck waiting for FIFO event that was on disk | PR #54 | Added startup drain (check disk before FIFO) + loop drain (check disk every 120s on FIFO timeout) to wake-on-event.sh. Previously only UserPromptSubmit drained disk, which never fires in autonomous mode. |
 
 ---
 
@@ -165,7 +169,11 @@ These are NOT bugs to debug — they're inherent to the design. Don't waste time
 - The next `wake-claude.sh` DEFER (cleans the lock, but doesn't deliver — there's no reader)
 - The next `UserPromptSubmit` in that session (cleans the lock; the model's response triggers Stop → new reader)
 
-So between SIGKILL and the next user prompt, the session is "deaf" but events accumulate on disk and get drained on prompt.
+So between SIGKILL and the next user prompt, the session is "deaf" but events accumulate on disk. **Mitigation (PR #54):** when the next reader spawns, its startup drain picks up DEFER'd events from disk immediately. If the reader stays alive, the loop drain checks disk every 120s.
+
+### L1b — asyncRewake hook not spawned (session idle, no Stop event)
+
+Claude Code only spawns the asyncRewake hook on `SessionStart` and `Stop` events. If the hook exits (for any reason) while the session is idle at the prompt, there is no `Stop` event to trigger a respawn. The session goes deaf until the user types something. **Observed:** PID 9085 (cr session) had a zombie hook child (spawned at 14:16, died silently) and no replacement spawned for 50+ minutes. The startup drain can only help when the hook DOES spawn — it can't force Claude Code to spawn it. UserPromptSubmit (check-deploy-status.sh) remains the only recovery path for this case.
 
 ### L2 — Verify-complete race vs. manual verification
 
@@ -234,6 +242,7 @@ gh run view <RUN_ID> --repo <REPO> --log | grep -A 5 "Notify Claude Code"
 | `WAKE_CLAUDE_WRITE_TIMEOUT` | 3 | Per-attempt FIFO write timeout |
 | `WAKE_CLAUDE_MAX_EVENT_AGE` | 3600 | Drop event files older than this (sec) |
 | `WAKE_FEEDBACK_MAX_ENTRIES` | 5 | How many recent feedback entries check-deploy-status.sh surfaces on prompt |
+| `FIFO_TIMEOUT_SECS` | 120 | wake-on-event.sh FIFO read timeout; loop drain checks disk on each timeout (hardcoded, not env var) |
 
 ---
 

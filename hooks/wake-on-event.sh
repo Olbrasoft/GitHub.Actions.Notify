@@ -498,6 +498,46 @@ process_event() {
 }
 
 ###############################################################################
+# Startup drain: process DEFER'd events from disk before blocking on FIFO
+###############################################################################
+#
+# When wake-claude.sh cannot deliver via FIFO (session is busy processing
+# tools, no asyncRewake reader available), it DEFERs the event to disk:
+#   ~/.config/claude-channels/deploy-events/{REPO_PREFIX}*.json
+#
+# Previously, these DEFER'd files were only drained by check-deploy-status.sh
+# on UserPromptSubmit — which never fires in autonomous mode. This caused a
+# recurring deadlock:
+#
+#   1. CI event delivered via FIFO → session wakes, processes it
+#   2. Copilot review event arrives seconds later → no reader → DEFER'd to disk
+#   3. Session finishes CI processing → Stop → asyncRewake → new hook spawns
+#   4. New hook blocks on FIFO — but the review event is on DISK, not in FIFO
+#   5. Session waits forever for a FIFO event that will never come
+#
+# Fix: on every hook startup, check disk FIRST. If a pending event exists
+# for this repo, process it immediately and exit 2 (wake the session).
+# The FIFO is NOT opened during the drain to prevent a race where
+# wake-claude.sh writes to the FIFO (seeing a reader), but the data is
+# never consumed (we exit 2 for the disk event instead).
+
+EVENTS_DIR="${HOME}/.config/claude-channels/deploy-events"
+REPO_PREFIX=$(git remote get-url origin 2>/dev/null | sed 's|.*github.com[:/]||;s|\.git$||' | tr '/' '-')
+
+if [ -n "$REPO_PREFIX" ] && [ -d "$EVENTS_DIR" ]; then
+    for event_file in "$EVENTS_DIR"/${REPO_PREFIX}*.json; do
+        [ -f "$event_file" ] || continue
+        event_data=$(cat "$event_file" 2>/dev/null)
+        rm -f "$event_file"
+        if [ -n "$event_data" ]; then
+            echo "[wake-on-event] Startup drain: processing DEFER'd event: $(basename "$event_file")" >&2
+            process_event "$event_data"
+            exit 2
+        fi
+    done
+fi
+
+###############################################################################
 # Main loop: block on FIFO
 ###############################################################################
 #
@@ -517,12 +557,19 @@ exec 3<>"$FIFO"
 
 # Re-check that the parent Claude process is still alive. The startup
 # suicide check at the top only fires once, but the loop below blocks
-# for up to 600s in `read`. If the parent dies during that block, the
-# hook gets reparented to systemd-user and would otherwise stay alive
-# forever, accumulating one orphan per dead session. See bug 32.
+# for up to FIFO_TIMEOUT_SECS in `read`. If the parent dies during
+# that block, the hook gets reparented to systemd-user and would
+# otherwise stay alive forever, accumulating one orphan per dead
+# session. See bug 32.
 parent_alive() {
     kill -0 "$CLAUDE_PID" 2>/dev/null
 }
+
+# FIFO read timeout (seconds). After each timeout the loop drains any
+# DEFER'd events from disk.  120s is a good balance between latency
+# (how long a DEFER'd event waits) and efficiency (how often we wake
+# from sleep to do a no-op glob).
+FIFO_TIMEOUT_SECS=120
 
 while true; do
     if ! parent_alive; then
@@ -531,11 +578,11 @@ while true; do
         exec 3<&-
         exit 0
     fi
-    # Read one NDJSON line with a 600s safety timeout. read returns 0 on
-    # success, non-zero on timeout (no input within 600s) or EOF (no
-    # writers — but FD 3 is also write-open, so we never see real EOF).
+    # Read one NDJSON line with a timeout. read returns 0 on success,
+    # non-zero on timeout or EOF (but FD 3 is also write-open, so we
+    # never see real EOF).
     EVENT_DATA=""
-    if IFS= read -r -t 600 EVENT_DATA <&3; then
+    if IFS= read -r -t "$FIFO_TIMEOUT_SECS" EVENT_DATA <&3; then
         if ! parent_alive; then
             exec 3<&-
             exit 0
@@ -545,8 +592,30 @@ while true; do
         exec 3<&-
         exit 2
     fi
-    # read timed out: nothing arrived in 600s. Refresh manifest with
-    # current cwd (cheap) and loop back.
+
+    ###########################################################################
+    # Loop drain: check disk for DEFER'd events on every FIFO timeout
+    ###########################################################################
+    #
+    # Same logic as startup drain but runs periodically while the hook is
+    # alive. Catches events that were DEFER'd by wake-claude.sh when this
+    # hook's FIFO had no reader (e.g. during a previous tool-execution gap
+    # that caused the prior hook instance to exit 2 for a different event).
+    if [ -n "$REPO_PREFIX" ] && [ -d "$EVENTS_DIR" ]; then
+        for event_file in "$EVENTS_DIR"/${REPO_PREFIX}*.json; do
+            [ -f "$event_file" ] || continue
+            event_data=$(cat "$event_file" 2>/dev/null)
+            rm -f "$event_file"
+            if [ -n "$event_data" ]; then
+                echo "[wake-on-event] Loop drain: processing DEFER'd event: $(basename "$event_file")" >&2
+                process_event "$event_data"
+                exec 3<&-
+                exit 2
+            fi
+        done
+    fi
+
+    # Refresh manifest with current cwd (cheap) and loop back.
     jq -n \
         --argjson pid "$CLAUDE_PID" \
         --arg fifo "$FIFO" \
