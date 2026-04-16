@@ -342,6 +342,20 @@ class WebhookHandler(BaseHTTPRequestHandler):
                   file=sys.stderr)
             return
 
+        # Guard against premature "success" when only fast external checks
+        # (e.g. GitGuardian) have completed but the main CI workflow hasn't
+        # even registered its checks yet. With only 1 terminal check and
+        # 0 pending, statusCheckRollup simply doesn't contain the other
+        # checks — they don't exist yet, so they're not "pending" either.
+        # Deferring when total checks <= 1 prevents false-positive success
+        # events that would cause the session to merge failing code.
+        total_checks = agg["success"] + agg["failure"] + agg["skipped"]
+        if total_checks <= 1 and not agg["any_failure"]:
+            print(f"[webhook-receiver] PR #{pr_number}: only {total_checks} check(s) terminal, "
+                  f"too early to declare success — deferring (other workflows may not have registered yet)",
+                  file=sys.stderr)
+            return
+
         # All checks are terminal. Determine the final status.
         final_status = "failure" if agg["any_failure"] else "success"
 

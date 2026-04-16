@@ -97,12 +97,17 @@ if (!REPO_PREFIX) {
   // Process any existing event files (startup drain)
   drainPending();
 
-  // Watch for new event files
+  // Watch for new event files (handles direct creates)
   watch(EVENTS_DIR, (eventType, filename) => {
     if (!filename || !filename.startsWith(REPO_PREFIX) || !filename.endsWith(".json")) return;
+    if (filename.endsWith(".tmp")) return; // skip temp files from atomic writes
     // Small delay to ensure file is fully written
     setTimeout(() => processEventFile(join(EVENTS_DIR, filename)), 100);
   });
+
+  // Fallback poll every 5s — catches files created via os.rename (atomic write)
+  // that fs.watch may miss on some Linux/inotify configurations.
+  setInterval(() => drainPending(), 5000);
 }
 
 function drainPending() {
