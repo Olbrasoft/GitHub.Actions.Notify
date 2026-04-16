@@ -70,6 +70,18 @@ Requires the `ci-pipeline` agent type in VirtualAssistant (AgentType.CiPipeline 
 - Test by triggering a workflow that uses the actions on a self-hosted runner
 - Verify FIFO wake works: check `/tmp/claude-wake/{REPO}/` for session registrations
 
+## Wake Event Handling
+
+When your session receives a wake event (ci-complete, code-review-complete, deploy-complete, verify-complete), follow the runbook: **`docs/session-wake-runbook.md`**
+
+Key rules that prevent sessions from getting stuck:
+
+1. **Copilot reviews ONCE** — after CI green on fix commit, MERGE. No second review arrives.
+2. **cr has NO deploy workflow** — after merge, your job ends. No deploy-complete event will come.
+3. **Post-merge CI on main does NOT trigger a wake** — don't wait for it.
+
+For system-level debugging (events not arriving): **`docs/wake-notification-system.md`**
+
 ## Engineering Handbook
 
 General development standards: `~/GitHub/Olbrasoft/engineering-handbook/`
