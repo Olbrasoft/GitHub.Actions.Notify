@@ -156,6 +156,7 @@ The event was never produced. Two sub-cases:
 | Deploy event dropped because PR is merged | session waited for deploy that was silently dropped | PR #50 | Guard scoped to ci-complete/code-review-complete only |
 | wake-claude.sh decisions invisible | journal showed "Wake signal sent" but no result | PR #51 | webhook-receiver inherits stderr instead of DEVNULL |
 | DEFER'd event never picked up (autonomous deadlock) | Session stuck waiting for FIFO event that was on disk | PR #54 | Added startup drain (check disk before FIFO) + loop drain (check disk every 120s on FIFO timeout) to wake-on-event.sh. Previously only UserPromptSubmit drained disk, which never fires in autonomous mode. |
+| Session passively waits for review wake that never arrives | Session says "waiting for review wake" after CI pass | PR #55 | ci-complete handler rewritten as complete unit of work: polls for Copilot review (60s intervals, up to 10min) instead of passively waiting for code-review-complete wake. |
 
 ---
 
