@@ -99,8 +99,9 @@ if (!REPO_PREFIX) {
 
   // Watch for new event files (handles direct creates)
   watch(EVENTS_DIR, (eventType, filename) => {
-    if (!filename || !filename.startsWith(REPO_PREFIX) || !filename.endsWith(".json")) return;
+    if (!filename || !filename.startsWith(REPO_PREFIX)) return;
     if (filename.endsWith(".tmp")) return; // skip temp files from atomic writes
+    if (!filename.endsWith(".json")) return;
     // Small delay to ensure file is fully written
     setTimeout(() => processEventFile(join(EVENTS_DIR, filename)), 100);
   });
@@ -121,7 +122,12 @@ function drainPending() {
   } catch {}
 }
 
+// In-flight guard: prevents duplicate sends when poll and watch fire for the same file
+const inFlight = new Set<string>();
+
 function processEventFile(filepath: string) {
+  if (inFlight.has(filepath)) return;
+  inFlight.add(filepath);
   try {
     if (!existsSync(filepath)) return;
     const content = readFileSync(filepath, "utf-8");
@@ -148,11 +154,11 @@ function processEventFile(filepath: string) {
       method: "notifications/claude/channel",
       params: { content, meta },
     }).then(() => {
-      // Delete only after successful send
       try { unlinkSync(filepath); } catch {}
+      inFlight.delete(filepath);
     }).catch((err) => {
       console.error(`[github-webhook] Failed to push ${basename(filepath)}: ${err}`);
-      // File stays on disk for retry on next watch trigger
+      inFlight.delete(filepath);
     });
   } catch (err) {
     console.error(`[github-webhook] Error processing ${filepath}: ${err}`);
