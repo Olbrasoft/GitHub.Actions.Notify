@@ -80,14 +80,15 @@ gh pr view <PR_NUM> --repo <REPO> --json state,mergeable,statusCheckRollup,revie
 
 Then apply these rules:
 
-| state | checks_pass | copilot.state | Action |
-|---|---|---|---|
-| OPEN | true | COMMENTED (0 unresolved comments) | **MERGE NOW** |
-| OPEN | true | COMMENTED (comments you already fixed) | **MERGE NOW** — Copilot does NOT re-review |
-| OPEN | true | null (not reviewed yet) | WAIT for code-review-complete wake |
-| OPEN | false | any | WAIT for ci-complete wake (or fix if failure) |
-| MERGED | any | any | **SKIP — nothing to do** |
-| CLOSED | any | any | **SKIP — abandoned** |
+| state | mergeable | checks_pass | copilot.state | Action |
+|---|---|---|---|---|
+| MERGED | any | any | any | **SKIP — nothing to do** |
+| CLOSED | any | any | any | **SKIP — abandoned** |
+| OPEN | CONFLICTING | any | any | Rebase or resolve conflicts, push, wait for next ci-complete |
+| OPEN | UNKNOWN | any | any | Wait a few seconds and re-check (GitHub is computing) |
+| OPEN | MERGEABLE | false | any | WAIT for ci-complete wake (or fix if failure) |
+| OPEN | MERGEABLE | true | null (not reviewed yet) | WAIT for code-review-complete wake |
+| OPEN | MERGEABLE | true | COMMENTED/APPROVED/CHANGES_REQUESTED | **MERGE NOW** — Copilot does NOT re-review |
 
 ---
 
