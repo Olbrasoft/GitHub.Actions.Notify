@@ -342,6 +342,35 @@ class WebhookHandler(BaseHTTPRequestHandler):
                   file=sys.stderr)
             return
 
+        # Guard against premature "success" when only fast external checks
+        # (e.g. GitGuardian) have completed but the main CI workflow hasn't
+        # even registered its checks yet. With only 1 terminal check and
+        # 0 pending, statusCheckRollup simply doesn't contain the other
+        # checks — they don't exist yet, so they're not "pending" either.
+        #
+        # We defer when total checks <= 1 AND the check_suite event is
+        # less than 30 seconds old (grace window for other workflows to
+        # register). After 30s, if still only 1 check, allow it — the
+        # repo genuinely has only one check suite.
+        total_checks = agg["success"] + agg["failure"] + agg["skipped"]
+        if total_checks <= 1 and not agg["any_failure"]:
+            # Check how old the check_suite event is
+            suite_created = check_suite.get("created_at", "")
+            grace_expired = True
+            if suite_created:
+                try:
+                    from email.utils import parsedate_to_datetime
+                    created_dt = datetime.fromisoformat(suite_created.replace("Z", "+00:00"))
+                    age_secs = (datetime.now(timezone.utc) - created_dt).total_seconds()
+                    grace_expired = age_secs > 30
+                except (ValueError, TypeError):
+                    pass
+            if not grace_expired:
+                print(f"[webhook-receiver] PR #{pr_number}: only {total_checks} check(s) terminal, "
+                      f"deferring for grace window (other workflows may not have registered yet)",
+                      file=sys.stderr)
+                return
+
         # All checks are terminal. Determine the final status.
         final_status = "failure" if agg["any_failure"] else "success"
 
