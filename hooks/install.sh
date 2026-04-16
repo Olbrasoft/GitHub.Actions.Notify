@@ -39,6 +39,26 @@ esac
 
 mkdir -p "$INSTALL_DIR"
 
+# Clean up legacy FIFO wake scripts from previous installs
+LEGACY_HOOKS=(wake-on-event.sh wake-claude.sh check-deploy-status.sh)
+for legacy in "${LEGACY_HOOKS[@]}"; do
+    dst="$INSTALL_DIR/$legacy"
+    if [ -f "$dst" ]; then
+        if [ "$MODE" = "check" ]; then
+            echo "[install] LEGACY detected: $dst (should be removed)" >&2
+        else
+            rm -f "$dst"
+            echo "[install] removed legacy: $legacy"
+        fi
+    fi
+done
+
+# Clean up legacy FIFO artifacts
+if [ -d "/tmp/claude-wake" ] && [ "$MODE" != "check" ]; then
+    rm -rf /tmp/claude-wake
+    echo "[install] removed legacy /tmp/claude-wake/"
+fi
+
 drift_count=0
 install_count=0
 skip_count=0
@@ -112,6 +132,12 @@ Add to mcpServers:
 Then start with: claude --dangerously-load-development-channels server:github-webhook
 EOF
     fi
+fi
+
+# Check for stale asyncRewake hooks in settings.json
+SETTINGS_JSON="$HOME/.claude/settings.json"
+if [ -f "$SETTINGS_JSON" ] && grep -q "asyncRewake\|wake-on-event\|wake-claude" "$SETTINGS_JSON"; then
+    echo "[install] WARNING: legacy asyncRewake hooks found in $SETTINGS_JSON — remove them manually" >&2
 fi
 
 # Check webhook forward service
