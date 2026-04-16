@@ -219,3 +219,4 @@ To verify the wake system works end-to-end, create a PR, go idle, and confirm th
 - No prefix — direct FIFO delivery (fastest path)
 
 **Update this file when you discover a new "session got stuck" pattern.** Add it to the common mistakes table with the prevention rule.
+# Channel E2E test 2026-04-16T15:36:01Z
