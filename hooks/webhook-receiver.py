@@ -352,23 +352,31 @@ class WebhookHandler(BaseHTTPRequestHandler):
         # less than 30 seconds old (grace window for other workflows to
         # register). After 30s, if still only 1 check, allow it — the
         # repo genuinely has only one check suite.
+        #
+        # If we defer, we schedule a delayed retry after the grace window.
+        # Without this retry, repos with a single check (e.g. GitHub.Issues
+        # with only GitGuardian) would NEVER fire the success event, because
+        # no second check_suite event arrives to re-trigger evaluation.
         total_checks = agg["success"] + agg["failure"] + agg["skipped"]
         if total_checks <= 1 and not agg["any_failure"]:
-            # Check how old the check_suite event is
             suite_created = check_suite.get("created_at", "")
-            grace_expired = True
+            age_secs = 0.0
             if suite_created:
                 try:
-                    from email.utils import parsedate_to_datetime
                     created_dt = datetime.fromisoformat(suite_created.replace("Z", "+00:00"))
                     age_secs = (datetime.now(timezone.utc) - created_dt).total_seconds()
-                    grace_expired = age_secs > 30
                 except (ValueError, TypeError):
                     pass
-            if not grace_expired:
+            if age_secs <= 30:
+                delay = max(1.0, 31.0 - age_secs)
                 print(f"[webhook-receiver] PR #{pr_number}: only {total_checks} check(s) terminal, "
-                      f"deferring for grace window (other workflows may not have registered yet)",
+                      f"deferring for grace window — will re-check in {delay:.0f}s",
                       file=sys.stderr)
+                threading.Timer(
+                    delay,
+                    self._retry_after_grace,
+                    args=(repo_name, pr_number, head_sha),
+                ).start()
                 return
 
         # All checks are terminal. Determine the final status.
@@ -441,6 +449,83 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
         print(f"[webhook-receiver] CI {final_status} event written: {repo_name} PR #{pr_number} "
               f"(branch: {pr_branch}, commit: {head_sha_short}, "
+              f"checks: {agg['success']}s/{agg['failure']}f/{agg['skipped']}skip)",
+              file=sys.stderr)
+
+        _wake(repo_name, pr_branch)
+
+    def _retry_after_grace(self, repo_name, pr_number, head_sha):
+        """Re-evaluate PR check status after the grace window has expired.
+
+        Called by threading.Timer when the initial check_suite event was
+        deferred because total_checks <= 1 within the grace window. For
+        repos with a single check (e.g. GitHub.Issues with only GitGuardian),
+        no second check_suite event ever arrives — without this retry, the
+        success event would never fire.
+        """
+        agg = self._aggregate_pr_checks(repo_name, pr_number)
+        if agg is None:
+            print(f"[webhook-receiver] retry PR #{pr_number}: gh pr view failed, giving up",
+                  file=sys.stderr)
+            return
+
+        # Stale-PR guard: skip if PR was closed/merged during the grace window
+        pr_state = (agg.get("state") or "open").lower()
+        pr_merged = bool(agg.get("merged"))
+        if pr_merged or pr_state != "open":
+            return
+
+        if not agg["all_terminal"]:
+            print(f"[webhook-receiver] retry PR #{pr_number}: still {agg['pending']} pending, "
+                  f"deferring (will re-fire when next check_suite arrives)",
+                  file=sys.stderr)
+            return
+
+        if agg["any_failure"]:
+            final_status = "failure"
+        else:
+            final_status = "success"
+
+        if _ci_dedup_check(repo_name, pr_number, head_sha, final_status):
+            return
+
+        head_sha_short = head_sha[:7]
+        repo_file = repo_name.replace("/", "-")
+        event_file = os.path.join(EVENTS_DIR, f"{repo_file}-ci-{pr_number}-{head_sha}.json")
+        if os.path.exists(event_file):
+            return
+
+        # Look up branch name for the wake (the original event's pr_branch
+        # is not in scope here — recover it from the gh query).
+        pr_branch = ""
+        try:
+            result = subprocess.run(
+                ["gh", "pr", "view", str(pr_number), "--repo", repo_name,
+                 "--json", "headRefName"],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                pr_branch = json.loads(result.stdout).get("headRefName", "")
+        except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
+            pass
+
+        event = {
+            "event": "ci-complete",
+            "status": final_status,
+            "repository": repo_name,
+            "prNumber": pr_number,
+            "commit": head_sha_short,
+            "branch": pr_branch,
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        tmp_file = event_file + ".tmp"
+        with open(tmp_file, "w") as f:
+            json.dump(event, f, indent=2)
+        os.rename(tmp_file, event_file)
+        _ci_dedup_mark_emitted(repo_name, pr_number, head_sha, final_status)
+
+        print(f"[webhook-receiver] retry CI {final_status} event written: {repo_name} "
+              f"PR #{pr_number} (branch: {pr_branch}, commit: {head_sha_short}, "
               f"checks: {agg['success']}s/{agg['failure']}f/{agg['skipped']}skip)",
               file=sys.stderr)
 
