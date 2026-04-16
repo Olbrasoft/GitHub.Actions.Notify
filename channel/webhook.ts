@@ -130,18 +130,23 @@ function processEventFile(filepath: string) {
   const now = Date.now();
   const startedAt = inFlight.get(filepath);
   if (startedAt && now - startedAt < 10_000) return;
-  inFlight.set(filepath, now);
+  // Per-attempt token: only the attempt whose token matches the current inFlight
+  // value is allowed to clear the entry / delete the file. Prevents a stale
+  // attempt's late resolution from clobbering a fresher attempt.
+  const token = now;
+  inFlight.set(filepath, token);
+  const ownsAttempt = () => inFlight.get(filepath) === token;
 
   try {
     if (!existsSync(filepath)) {
-      inFlight.delete(filepath);
+      if (ownsAttempt()) inFlight.delete(filepath);
       return;
     }
     const content = readFileSync(filepath, "utf-8");
 
     if (!content.trim()) {
       try { unlinkSync(filepath); } catch {}
-      inFlight.delete(filepath);
+      if (ownsAttempt()) inFlight.delete(filepath);
       return;
     }
 
@@ -163,14 +168,16 @@ function processEventFile(filepath: string) {
       params: { content, meta },
     }).then(() => {
       console.error(`[github-webhook] Delivered: ${basename(filepath)}`);
-      try { unlinkSync(filepath); } catch {}
-      inFlight.delete(filepath);
+      if (ownsAttempt()) {
+        try { unlinkSync(filepath); } catch {}
+        inFlight.delete(filepath);
+      }
     }).catch((err) => {
       console.error(`[github-webhook] Failed to push ${basename(filepath)}: ${err}`);
-      inFlight.delete(filepath);
+      if (ownsAttempt()) inFlight.delete(filepath);
     });
   } catch (err) {
     console.error(`[github-webhook] Error processing ${filepath}: ${err}`);
-    inFlight.delete(filepath);
+    if (ownsAttempt()) inFlight.delete(filepath);
   }
 }
