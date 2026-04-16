@@ -1,40 +1,37 @@
 # Session Wake Runbook — What To Do When a Wake Event Arrives
 
-**Read this file when you are a Claude Code session and you received a wake event (ci-complete, code-review-complete, deploy-complete, verify-complete) via the asyncRewake hook.**
+**Read this file when you are a Claude Code session and you just received a
+wake event (ci-complete, code-review-complete, deploy-complete,
+verify-complete) typed into your prompt by ghnotify.**
 
 This runbook exists because sessions repeatedly got stuck in one of these loops:
 
-1. Waiting for CI that already arrived
-2. Waiting for a second Copilot review that will never arrive
-3. Waiting for a deploy event on a repo that has no deploy workflow
-4. Receiving a wake event but not acting on it
+1. Waiting for CI that already arrived.
+2. Waiting for a second Copilot review that will never arrive.
+3. Waiting for a deploy event on a repo that has no deploy workflow.
+4. Receiving a wake event but not acting on it.
 
-## What changed (2026-04-16)
+## How wake events arrive
 
-### Prescriptive wake instructions (PR #53)
+[ghnotify](https://github.com/Olbrasoft/ghnotify) runs as a systemd user
+service. For each Olbrasoft repo with an active `claude` session it spawns one
+`gh webhook forward` subprocess and dispatches incoming events to the matching
+`claude-<repo>` tmux session via `tmux send-keys`. The event shows up in your
+input the next time the assistant returns to the prompt.
 
-The wake event instructions injected by `wake-on-event.sh` have been rewritten to be **prescriptive, not advisory.** Previously, the ci-complete instructions said "check if comments already addressed" — sessions debated endlessly instead of merging. Now the instructions are a decision procedure:
+There is no FIFO, no per-session port allocation, and no on-disk DEFER queue
+anymore — if you weren't at the prompt when the event arrived, the buffered
+text is still in your input box waiting for you. If your session wasn't running
+at all, the event is discarded (the `discarded:true` reply is logged in
+`journalctl --user -u ghnotify-watch`). GitHub keeps the missed delivery in
+its 30-day delivery history; manual replay via the REST API is the only way
+to get it back.
 
-1. Run ONE command (`gh pr view` with specific jq)
-2. Match the FIRST applicable rule (no deliberation)
-3. Act (MERGE / WAIT / SKIP)
-
-### Startup drain + loop drain (PR #54)
-
-**The recurring deadlock was:** two events arrive close together (e.g., CI complete at 14:53, Copilot review at 14:54). The first event is delivered via FIFO. The second event arrives while the session is processing the first one (no FIFO reader available) → DEFER'd to disk. Previously, the disk file was only drained on `UserPromptSubmit` (user types something), which **never fires in autonomous mode** → session waits forever.
-
-**Fix:** `wake-on-event.sh` now has THREE delivery paths:
-1. **Startup drain** — on every hook spawn, check disk for pending events BEFORE blocking on FIFO
-2. **FIFO delivery** — instant wake via named pipe (primary path, unchanged)
-3. **Loop drain** — every 120s FIFO timeout, check disk for DEFER'd events
-
-The `check-deploy-status.sh` on UserPromptSubmit is now a tertiary fallback.
-
-### Reference
-
-The `ci-workflow-monitor` skill in `skills/ci-workflow-monitor/SKILL.md` has the full state machine (Phase A/B/C) and Critical Rule #7 about Copilot reviewing once. **Re-read the skill file** (`cat ~/Olbrasoft/GitHub.Actions.Notify/skills/ci-workflow-monitor/SKILL.md`) if you're unsure about the lifecycle.
-
-The hook files in `~/.claude/hooks/` are the installed versions — they may be outdated if the user hasn't run `./hooks/install.sh --force` recently. If instructions seem wrong, run install first.
+The `ci-workflow-monitor` skill in
+`skills/ci-workflow-monitor/SKILL.md` has the full state machine and the
+Copilot-reviews-once rule. **Re-read the skill file**
+(`cat ~/Olbrasoft/GitHub.Actions.Notify/skills/ci-workflow-monitor/SKILL.md`)
+if you're unsure about the lifecycle.
 
 ---
 
@@ -153,18 +150,7 @@ After you merge a PR, GitHub runs CI on the merge commit on main. This CI run ha
 
 ## After acting on a wake event
 
-Always log your classification:
-
-```bash
-~/.claude/hooks/log-wake-feedback.sh \
-    event=<type> \
-    repo=<repo> \
-    classification=ok|late|stale \
-    delay=<from event instructions> \
-    note="<what you did>"
-```
-
-Then notify the user:
+Notify the user:
 
 ```
 mcp__notify__notify(text: "<Czech summary of what happened>")
@@ -180,14 +166,12 @@ If you're confused about the current state, run:
 # Full PR state in one command
 gh pr view <NUM> --repo <REPO> --json state,mergeable,statusCheckRollup,reviews,title,headRefName
 
-# Recent wake feedback from all sessions (what did others do?)
-tail -40 ~/.config/claude-channels/wake-feedback.md
-
-# What events are pending on disk (not yet delivered)?
-ls -la ~/.config/claude-channels/deploy-events/
+# Recent ghnotify dispatches (what did the forwarder route lately?)
+journalctl --user -u ghnotify-watch -n 80 --no-pager
 ```
 
-**Do NOT passively wait if you're unsure.** Run the diagnostic, decide, act, log. A wrong action that gets logged is better than an indefinite wait that blocks the user.
+**Do NOT passively wait if you're unsure.** Run the diagnostic, decide, act.
+A wrong action is better than an indefinite wait that blocks the user.
 
 ---
 
@@ -200,22 +184,24 @@ ls -la ~/.config/claude-channels/deploy-events/
 | Wait for post-merge CI | Session hangs forever | Rule 3: main CI doesn't trigger wake |
 | Receive CI success but don't merge | Session sits idle | MERGE DECISION table: checks_pass + copilot reviewed → MERGE |
 | Receive CI failure but wait | Session sits idle | Fix immediately, don't wait for another wake |
-| Two events arrive close together | Second event DEFER'd, session waits forever | Startup drain + loop drain (PR #54): hook checks disk on spawn and every 120s |
-| Hook dies, session goes deaf | No reader, all events DEFER to disk | Startup drain on next hook spawn; if hook never spawns, user must type to trigger UserPromptSubmit fallback |
+| Two events arrive close together | Both arrive in the input buffer; second appears after first prompt cycle | Process them in order; don't claim the second was lost |
+| ghnotify-watch service down | Wake events never arrive, GitHub records `discarded:true` (no — silently 30-day history) | `systemctl --user status ghnotify-watch`; restart if needed |
 
 ---
 
 ## Where this file lives
 
-- Canonical: `docs/session-wake-runbook.md` in [Olbrasoft/GitHub.Actions.Notify](https://github.com/Olbrasoft/GitHub.Actions.Notify)
-- For system-level architecture and failure modes: see `docs/wake-notification-system.md`
-- For the hook code itself: `hooks/` directory
+- Canonical: `docs/session-wake-runbook.md` in
+  [Olbrasoft/GitHub.Actions.Notify](https://github.com/Olbrasoft/GitHub.Actions.Notify).
+- The forwarder source: [Olbrasoft/ghnotify](https://github.com/Olbrasoft/ghnotify).
 
 ## Testing the wake system
 
-To verify the wake system works end-to-end, create a PR, go idle, and confirm the session is woken by the async wake path rather than by manual input / `UserPromptSubmit` fallback. A correct wake arrives via either the direct FIFO path (immediate) or the startup/loop drain (DEFER'd event picked up within seconds to 120s). The session must be truly idle (at the prompt) when the event arrives. Check the wake log prefix to tell which path fired:
-- `[wake-on-event] Startup drain:` — event was DEFER'd, picked up on hook spawn
-- `[wake-on-event] Loop drain:` — event was DEFER'd, picked up on 120s timeout
-- No prefix — direct FIFO delivery (fastest path)
+To verify end-to-end: open a PR, let it go idle in the assistant, watch
+`journalctl --user -u ghnotify-watch -f`. When CI completes you should see
+`prompt delivered session=claude-<repo> event_type=workflow_run` (or
+`check_suite`), and the prompt text appears in the assistant's input box on
+its next idle cycle.
 
-**Update this file when you discover a new "session got stuck" pattern.** Add it to the common mistakes table with the prevention rule.
+**Update this file when you discover a new "session got stuck" pattern.**
+Add it to the common mistakes table with the prevention rule.

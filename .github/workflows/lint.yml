@@ -8,7 +8,6 @@ name: Lint
 # Lints exercised:
 #   * shellcheck on all hooks/*.sh and scripts/*.sh
 #   * bash -n on the same set as a syntax safety net
-#   * python -m py_compile on hooks/webhook-receiver.py
 #   * actionlint on all .github/workflows/*.yml
 #
 # These checks would have caught several real issues from PR #22's Copilot
@@ -37,14 +36,13 @@ jobs:
       - name: Run shellcheck on hooks/
         run: |
           set -e
-          # SC1091: don't follow sourced files (the install dir is runtime-only)
-          # SC2034: variables used by external scripts (e.g. PIDS in start-webhook-forwards.sh)
-          shellcheck --severity=warning --exclude=SC1091,SC2034 hooks/*.sh
+          # SC1091: don't follow sourced files (runtime-only paths)
+          shellcheck --severity=warning --exclude=SC1091 hooks/*.sh
 
       - name: Run shellcheck on scripts/
         run: |
           set -e
-          shellcheck --severity=warning --exclude=SC1091,SC2034 scripts/*.sh
+          shellcheck --severity=warning --exclude=SC1091 scripts/*.sh
 
   bash-syntax:
     name: bash -n
@@ -60,19 +58,6 @@ jobs:
             echo "checking: $f"
             bash -n "$f"
           done
-
-  python-syntax:
-    name: python compile
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.x'
-
-      - name: py_compile webhook-receiver.py
-        run: python -m py_compile hooks/webhook-receiver.py
 
   actionlint:
     name: actionlint
