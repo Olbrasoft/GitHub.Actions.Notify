@@ -1,15 +1,30 @@
-# channel
+# GitHub Webhook Channel for Claude Code
 
-To install dependencies:
+MCP channel server that delivers GitHub CI/CD events to Claude Code sessions via native Channels API.
+
+## Setup
 
 ```bash
 bun install
 ```
 
-To run:
+## Usage
+
+Registered as MCP server in `~/.claude.json`. Claude Code spawns it automatically.
+
+Start Claude Code with the channel enabled:
 
 ```bash
-bun run index.ts
+claude --dangerously-load-development-channels server:github-webhook
 ```
 
-This project was created using `bun init` in bun v1.3.5. [Bun](https://bun.com) is a fast all-in-one JavaScript runtime.
+## How it works
+
+Watches `~/.config/claude-channels/deploy-events/` for event files matching the current repo. When a file appears, reads it, pushes the content to Claude Code via MCP channel notification, then deletes the file.
+
+## Architecture
+
+```
+GitHub → gh webhook forward → webhook-receiver.py (port 9877) → event file
+→ webhook.ts (fs.watch) → MCP channel notification → Claude Code session
+```

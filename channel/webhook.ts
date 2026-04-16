@@ -11,6 +11,14 @@
  *   → THIS SERVER (fs.watch) → Claude Code session via MCP channel
  *
  * Replaces: wake-on-event.sh, wake-claude.sh, check-deploy-status.sh
+ *
+ * Migration note: During migration, both this channel and the legacy
+ * wake-claude.sh path may run. wake-claude.sh deletes event files after
+ * FIFO delivery, so this watcher may miss files consumed by the old path.
+ * This is harmless (duplicate delivery is OK, the model checks PR state).
+ * After migration is complete, remove wake-claude.sh calls from
+ * webhook-receiver.py so this channel is the sole consumer.
+ *
  * @see https://code.claude.com/docs/en/channels-reference
  */
 
@@ -35,9 +43,11 @@ function getRepoPrefix(): string {
   }
 }
 
+// Always use ~/.config/ — must match existing producers (webhook-receiver.py,
+// wake-claude.sh, check-deploy-status.sh) which all hardcode this path.
 const EVENTS_DIR = join(
-  process.env.XDG_CONFIG_HOME ?? join(process.env.HOME ?? "/tmp", ".config"),
-  "claude-channels/deploy-events"
+  process.env.HOME ?? "/tmp",
+  ".config/claude-channels/deploy-events"
 );
 const REPO_PREFIX = getRepoPrefix();
 
@@ -110,9 +120,11 @@ function processEventFile(filepath: string) {
   try {
     if (!existsSync(filepath)) return;
     const content = readFileSync(filepath, "utf-8");
-    unlinkSync(filepath);
 
-    if (!content.trim()) return;
+    if (!content.trim()) {
+      unlinkSync(filepath);
+      return;
+    }
 
     // Parse for meta attributes
     let meta: Record<string, string> = { file: basename(filepath) };
@@ -126,9 +138,16 @@ function processEventFile(filepath: string) {
 
     console.error(`[github-webhook] Pushing event: ${basename(filepath)}`);
 
+    // Push event to Claude Code session, then delete file
     mcp.notification({
       method: "notifications/claude/channel",
       params: { content, meta },
+    }).then(() => {
+      // Delete only after successful send
+      try { unlinkSync(filepath); } catch {}
+    }).catch((err) => {
+      console.error(`[github-webhook] Failed to push ${basename(filepath)}: ${err}`);
+      // File stays on disk for retry on next watch trigger
     });
   } catch (err) {
     console.error(`[github-webhook] Error processing ${filepath}: ${err}`);
