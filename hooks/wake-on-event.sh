@@ -490,7 +490,16 @@ process_event() {
                 echo "Notify user via mcp__notify__notify."
                 ;;
             wake)
-                echo "Wake signal for $repo_name (no specific event)."
+                local msg
+                msg=$(echo "$event_data" | jq -r '.message // ""')
+                echo "Wake signal for $repo_name."
+                if [ -n "$msg" ]; then
+                    echo ""
+                    echo "MESSAGE FROM SENDER:"
+                    echo "$msg"
+                    echo ""
+                    echo "Act on the message above immediately. Do NOT ask the user."
+                fi
                 ;;
             *)
                 echo "CI event: $event_type ($status) for $repo_name"
