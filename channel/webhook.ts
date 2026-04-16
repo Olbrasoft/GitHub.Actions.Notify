@@ -122,18 +122,26 @@ function drainPending() {
   } catch {}
 }
 
-// In-flight guard: prevents duplicate sends when poll and watch fire for the same file
-const inFlight = new Set<string>();
+// In-flight guard: prevents duplicate sends when poll and watch fire for the same file.
+// Entries expire after 10s to prevent permanent blocking if a promise hangs.
+const inFlight = new Map<string, number>();
 
 function processEventFile(filepath: string) {
-  if (inFlight.has(filepath)) return;
-  inFlight.add(filepath);
+  const now = Date.now();
+  const startedAt = inFlight.get(filepath);
+  if (startedAt && now - startedAt < 10_000) return;
+  inFlight.set(filepath, now);
+
   try {
-    if (!existsSync(filepath)) return;
+    if (!existsSync(filepath)) {
+      inFlight.delete(filepath);
+      return;
+    }
     const content = readFileSync(filepath, "utf-8");
 
     if (!content.trim()) {
-      unlinkSync(filepath);
+      try { unlinkSync(filepath); } catch {}
+      inFlight.delete(filepath);
       return;
     }
 
@@ -154,6 +162,7 @@ function processEventFile(filepath: string) {
       method: "notifications/claude/channel",
       params: { content, meta },
     }).then(() => {
+      console.error(`[github-webhook] Delivered: ${basename(filepath)}`);
       try { unlinkSync(filepath); } catch {}
       inFlight.delete(filepath);
     }).catch((err) => {
@@ -162,5 +171,6 @@ function processEventFile(filepath: string) {
     });
   } catch (err) {
     console.error(`[github-webhook] Error processing ${filepath}: ${err}`);
+    inFlight.delete(filepath);
   }
 }
